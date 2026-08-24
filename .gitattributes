@@ -5,6 +5,8 @@
 
 # Docs/config: normalize in the repo, LF on checkout
 *.md   text eol=lf
+*.txt  text eol=lf
+*.cff  text eol=lf
 LICENSE text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf

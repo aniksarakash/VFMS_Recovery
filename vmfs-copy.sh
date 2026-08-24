@@ -16,7 +16,8 @@
 #   ./vmfs-copy.sh --no-ddrescue            # rsync everything (faster, no retry)
 #   ./vmfs-copy.sh --big-mb 512             # ddrescue threshold
 #   ./vmfs-copy.sh --keep-logs              # also copy vmware-*.log
-#   ./vmfs-copy.sh --no-sudo               # already root / source readable
+#   ./vmfs-copy.sh --no-sudo                # already root / source readable
+#   ./vmfs-copy.sh --mapdir /mnt/d/.maps    # where ddrescue mapfiles live
 #===============================================================================
 
 set -uo pipefail
@@ -26,7 +27,7 @@ set -uo pipefail
 #------------------------------------------------------------------------------
 SRC="/mnt/vmfs"                   # where vmfs6-fuse mounted the datastore
 DEST="/mnt/d"                     # destination drive
-MAPDIR="${HOME}/vmfs-recovery"    # ddrescue mapfiles + per-file logs live here
+MAPDIR=""                         # ddrescue mapfiles + logs; default <DEST>/.vmfs-recovery
 BIG_MB=1024                       # files >= this many MB go through ddrescue
 ASSUME_ALL=0
 ASSUME_YES=0
@@ -39,7 +40,7 @@ BAR_W=38
 #------------------------------------------------------------------------------
 # Arg parsing
 #------------------------------------------------------------------------------
-usage() { sed -n '2,22p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0; }
+usage() { sed -n '2,21p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0; }
 while (($#)); do
   case $1 in
     --src)          SRC=${2:?missing value}; shift 2 ;;
@@ -56,6 +57,13 @@ while (($#)); do
     *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
   esac
 done
+
+# Mapfiles live beside the DESTINATION, never under $HOME. Running this script
+# with sudo flips $HOME to /root, so the same command as you vs. under sudo looks
+# in two different directories - which silently orphans an earlier run's mapfile
+# and makes ddrescue restart an already-finished image from byte 0. A mapfile is
+# only ever a valid claim about one specific output file, so it belongs with it.
+MAPDIR=${MAPDIR:-"$DEST/.vmfs-recovery"}
 
 #------------------------------------------------------------------------------
 # Cosmetics
@@ -139,6 +147,11 @@ else
   die "sudo authentication failed. Rerun as root, or with --no-sudo if the source is readable."
 fi
 
+command -v rsync >/dev/null 2>&1 \
+  || die "rsync not found - it copies every .vmx/.nvram/.vmsd and any disk below the
+       ddrescue threshold, so there is nothing to fall back on. Install it first:
+       sudo apt install rsync"
+
 if ((USE_DDRESCUE)) && ! command -v ddrescue >/dev/null 2>&1; then
   warn "ddrescue not found - falling back to rsync for large files."
   warn "Install for bad-sector resilience: sudo apt install gddrescue"
@@ -154,7 +167,8 @@ DEST_FREE=$(df -B1 --output=avail "$DEST" 2>/dev/null | tail -1 | tr -d ' ')
 DEST_FREE=${DEST_FREE:-0}
 ok "Destination: ${B}$DEST${R}  ($(human "$DEST_FREE") free)"
 
-mkdir -p "$MAPDIR" || die "Cannot create mapfile dir '$MAPDIR'"
+mkdir -p "$MAPDIR" 2>/dev/null || $SUDO mkdir -p "$MAPDIR" \
+  || die "Cannot create mapfile dir '$MAPDIR' (override with --mapdir)"
 ok "Mapfiles/logs: ${B}$MAPDIR${R}"
 
 #------------------------------------------------------------------------------
@@ -166,14 +180,28 @@ folder_bytes() {   # apparent size of all regular files under $1
   $SUDO find "$1" -type f -printf '%s\n' 2>/dev/null | awk '{s+=$1} END{print s+0}'
 }
 
+# Same, but skipping exactly what the copy skips. Measuring a destination against
+# the RAW source size can never reach 100% once anything is excluded: a folder
+# holding a 24GB .vswp would read "partial" forever no matter how many times it
+# finished, and the space check would demand room for bytes never written.
+folder_bytes_copyable() {
+  if ((KEEP_LOGS)); then
+    $SUDO find "$1" -type f ! -name '*.vswp' ! -name '*-ctk.vmdk' \
+      -printf '%s\n' 2>/dev/null
+  else
+    $SUDO find "$1" -type f ! -name '*.vswp' ! -name '*-ctk.vmdk' ! -name '*.log' \
+      -printf '%s\n' 2>/dev/null
+  fi | awk '{s+=$1} END{print s+0}'
+}
+
 NAMES=(); SIZES=(); NBIG=(); STATUS=()
 while IFS= read -r -d '' dir; do
   name=$(basename "$dir")
-  sz=$(folder_bytes "$dir")
+  sz=$(folder_bytes_copyable "$dir")
   big=$($SUDO find "$dir" -maxdepth 1 -type f -name '*.vmdk' \
           -size +$((BIG_MB - 1))M 2>/dev/null | wc -l | tr -d ' ')
   if [[ -d "$DEST/$name" ]]; then
-    dsz=$(folder_bytes "$DEST/$name")
+    dsz=$(folder_bytes_copyable "$DEST/$name")
     pct=$(awk -v d="$dsz" -v s="$sz" 'BEGIN{ if(s>0) printf "%d", d*100/s; else print 0 }')
     if   ((pct >= 100)); then st="${GR}complete${R}"
     elif ((pct  >   0)); then st="${YL}partial ${pct}%${R}"
@@ -197,7 +225,7 @@ done
 hr
 TOTAL_ALL=0
 for s in "${SIZES[@]}"; do TOTAL_ALL=$((TOTAL_ALL + s)); done
-info "${DIM}$N folders, $(human "$TOTAL_ALL") total. DISKS = .vmdk images >= ${BIG_MB}MB (ddrescue candidates).${R}"
+info "${DIM}$N folders, $(human "$TOTAL_ALL") to copy (excludes .vswp/.log). DISKS = .vmdk images >= ${BIG_MB}MB (ddrescue candidates).${R}"
 
 #------------------------------------------------------------------------------
 # SELECTION
@@ -268,9 +296,37 @@ ddr_field() {   # $1 logfile  $2 field label -> last occurrence with its value
     | grep -ao "$2[[:space:]]*[0-9.]*[[:space:]]*[A-Za-z%/]*" | tail -1
 }
 
+# A finished mapfile from an earlier run is the difference between "done in
+# seconds" and re-reading 90GB off a drive you are trying to be gentle with.
+# Naming and location have drifted across runs (an earlier loop wrote
+# "<Folder>-map.log" straight into $HOME), so when nothing sits at the expected
+# path, look for a mapfile that names THIS exact source AND this exact output and
+# adopt it. Matching both paths is what makes reuse safe: a mapfile asserts which
+# regions of one specific output file are already good, so applying one from a
+# different destination would mark never-written regions as rescued.
+adopt_mapfile() {   # $1 wanted mapfile  $2 source file  $3 output file
+  local want=$1 sf=$2 df=$3 cand
+  [[ -s $want ]] && return 0
+  for cand in "$MAPDIR"/*.map "$MAPDIR"/*.mapfile "$MAPDIR"/*map.log \
+              "${HOME:-/root}"/*.map "${HOME:-/root}"/*.mapfile "${HOME:-/root}"/*map.log \
+              /root/*.map /root/*.mapfile /root/*map.log \
+              /home/*/*.map /home/*/*.mapfile /home/*/*map.log; do
+    [[ -f $cand && -s $cand ]] || continue
+    [[ $cand == "$want" ]] && continue
+    $SUDO grep -aqF -- "$df" "$cand" 2>/dev/null || continue
+    $SUDO grep -aqF -- "$sf" "$cand" 2>/dev/null || continue
+    if $SUDO cp -f "$cand" "$want" 2>/dev/null; then
+      ok "Resuming from an earlier mapfile: ${DIM}$cand${R}"
+      return 0
+    fi
+  done
+  return 0
+}
+
 copy_big() {    # $1 srcfile  $2 dstfile  $3 mapfile  $4 total bytes  $5 label
   local sf=$1 df=$2 mf=$3 total=$4 label=$5
   local log="$MAPDIR/$(basename "$df").ddrescue.log"
+  adopt_mapfile "$mf" "$sf" "$df"
   printf '    %sddrescue ->%s %s %s(%s)%s\n' "$DIM" "$R" "$label" "$DIM" "$(human "$total")" "$R"
   printf '\033[?25l'
 
@@ -364,12 +420,13 @@ for i in "${SEL[@]}"; do
   copy_rest "$sdir" "$ddir" "${EXCL[@]}" || folder_rc=1
 
   # --- verify: apparent size src vs dest ---
-  s_b=$(folder_bytes "$sdir"); d_b=$(folder_bytes "$ddir")
+  s_b=$(folder_bytes_copyable "$sdir"); d_b=$(folder_bytes_copyable "$ddir")
   vpct=$(awk -v d="$d_b" -v s="$s_b" 'BEGIN{ if(s>0) printf "%.1f", d*100/s; else print 0 }')
   if awk -v p="$vpct" 'BEGIN{exit !(p >= 99.5)}'; then
     ok "Verified: $(human "$d_b") / $(human "$s_b")  (${vpct}%)"
   else
-    warn "Size delta: $(human "$d_b") / $(human "$s_b")  (${vpct}%) - excluded .vswp/.log explain some of this."
+    warn "Size delta: $(human "$d_b") / $(human "$s_b")  (${vpct}%) - both sides already"
+    warn "exclude .vswp/.log, so this is a real shortfall. Check the logs in $MAPDIR."
   fi
 
   if ((folder_rc)); then FAILED+=("$name"); else DONE+=("$name"); fi

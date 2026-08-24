@@ -1,0 +1,40 @@
+cff-version: 1.2.0
+message: "If you use this playbook or the copier script, please cite it as below."
+title: "VMFS Recovery: recovering VMware VMs from a bare VMFS6 datastore disk via WSL2"
+abstract: >-
+  A field-tested playbook and interactive Bash script for recovering VMware
+  virtual machines from a VMFS6 datastore disk that has been removed from an
+  ESXi host and attached to a Windows PC over USB. Windows cannot read VMFS, so
+  the disk is passed into WSL2 with usbipd-win and mounted with vmfs6-fuse.
+  vmfs-copy.sh then copies each VM folder out, routing large -flat.vmdk disk
+  images through GNU ddrescue (bad-sector retries, resumable via mapfile) and
+  small .vmx, .nvram, and descriptor files through rsync, with folder detection,
+  interactive selection, a live progress bar, a free-space check, and per-folder
+  verification. Covers crash and power-loss recovery mid-copy, and registering
+  the recovered VM on an ESXi 8 host.
+type: software
+authors:
+  - given-names: "Anik Sarker"
+    family-names: "Akash"
+    alias: "aniksarakash"
+    email: "56483143+aniksarakash@users.noreply.github.com"
+repository-code: "https://github.com/aniksarakash/VFMS_Recovery"
+url: "https://github.com/aniksarakash/VFMS_Recovery"
+license: MIT
+date-released: "2026-08-24"
+keywords:
+  - vmfs
+  - vmfs6
+  - vmware
+  - esxi
+  - vmdk
+  - ddrescue
+  - data-recovery
+  - disaster-recovery
+  - wsl2
+  - usbipd
+  - vmfs6-fuse
+  - rsync
+  - virtual-machine
+  - datastore
+  - bash

@@ -138,7 +138,51 @@ function Wsl ([string] $Cmd) {
 # usbipd 3.x, "Attached" on 4.x and later). A truncated name loses the "Mass
 # Storage" that the enclosure is recognised by, and unexpected STATE wording drops
 # the row entirely, which reads as "no devices found" with the enclosure plugged in.
+# Which physical disk sits behind each USB device, keyed by that device's PnP
+# instance id.
+#
+# Win32_DiskDrive.PNPDeviceID is no use on its own: a UAS enclosure enumerates
+# its child under a SCSI id that carries no VID or PID at all. But the PnP parent
+# of that SCSI node is the USB device node, serial included, so one hop up names
+# the enclosure exactly. Two identical bridges do not collide, because the
+# instance id carries the serial.
+#
+# This matters because the enclosure holding the copy destination sits on the
+# same bus as the one holding the source. Handing the wrong one to WSL takes the
+# destination away from Windows in the middle of a recovery.
+function Get-UsbDiskMap {
+  $map = @{}
+  # Index is the number Get-Disk reports, and PNPDeviceID is the same string
+  # Get-PnpDevice calls InstanceId. That is what ties the two views together.
+  $byPnp = @{}
+  foreach ($w in @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue)) {
+    if ($w.PNPDeviceID) { $byPnp["$($w.PNPDeviceID)".ToUpper()] = [int]$w.Index }
+  }
+  foreach ($pnp in @(Get-PnpDevice -PresentOnly -Class DiskDrive -ErrorAction SilentlyContinue)) {
+    $parent = $null
+    try {
+      $parent = (Get-PnpDeviceProperty -InstanceId $pnp.InstanceId `
+                   -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop).Data
+    } catch { continue }
+    # Only USB parents matter, and -like avoids having to escape the separator.
+    if (-not $parent -or "$parent" -notlike 'USB*') { continue }
+    $num = $byPnp["$($pnp.InstanceId)".ToUpper()]
+    if ($null -eq $num) { continue }
+    $letters = @()
+    foreach ($part in @(Get-Partition -DiskNumber $num -ErrorAction SilentlyContinue)) {
+      if ($part.DriveLetter) { $letters += "$($part.DriveLetter):" }
+    }
+    $map["$parent".ToUpper()] = [pscustomobject]@{
+      DiskNumber = $num
+      Model      = "$($pnp.FriendlyName)"
+      Letters    = $letters
+    }
+  }
+  return $map
+}
+
 function Get-Enclosure {
+  $held = Get-UsbDiskMap
   $json = & usbipd state 2>&1
   if ($LASTEXITCODE -eq 0) {
     $parsed = $null
@@ -161,6 +205,11 @@ function Get-Enclosure {
         if ($d.IsForced)        { $state = "$state (forced)" }
         if ($d.ClientIPAddress) { $state = 'Attached' }
         $name = "$($d.Description)".Trim()
+        # Resolve this before the hash literal: properties in a literal are
+        # evaluated in an order that has already bitten this file once.
+        $holds = $null
+        $ikey = "$($d.InstanceId)".ToUpper()
+        if ($held.ContainsKey($ikey)) { $holds = $held[$ikey] }
         $out += [pscustomobject]@{
           BusId  = "$($d.BusId)"
           VidPid = $vidpid
@@ -169,6 +218,8 @@ function Get-Enclosure {
           # A drive enclosure announces itself as mass storage. That is a better
           # signal than the vendor string, which is often a bare chipset name.
           IsMass = ($name -match 'Mass Storage|UAS|SCSI|Disk')
+          Holds  = $holds
+          DiskNumber = $(if ($holds) { $holds.DiskNumber } else { $null })
         }
       }
       # usbipd state returns devices unordered, and a plain string sort puts 2-10
@@ -185,6 +236,19 @@ function Get-Enclosure {
 # table carefully and stop at the "Persisted:" section, whose rows are remembered
 # devices, not present ones.
 function Get-EnclosureFromTable {
+  $held = Get-UsbDiskMap
+  # The old table gives no instance id, so VID:PID is all there is to match on.
+  # Two enclosures with the same bridge chip are therefore indistinguishable
+  # here, and guessing between them is exactly the mistake to avoid: mark the
+  # pair ambiguous and correlate neither.
+  $byVidPid = @{}
+  foreach ($hk in @($held.Keys)) {
+    if ($hk -match 'VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})') {
+      $vp = "$($Matches[1]):$($Matches[2])".ToLower()
+      if ($byVidPid.ContainsKey($vp)) { $byVidPid[$vp] = 'ambiguous' }
+      else { $byVidPid[$vp] = $held[$hk] }
+    }
+  }
   $raw = & usbipd list 2>&1
   if ($LASTEXITCODE -ne 0) {
     Bad 'usbipd could not list USB devices.'
@@ -207,6 +271,11 @@ function Get-EnclosureFromTable {
       $bus = $Matches[1]; $vidpid = $Matches[2]
       $name = $Matches[3].Trim(); $state = $Matches[4]
       if ($state -eq 'Attached - WSL') { $state = 'Attached' }
+      $holds = $null
+      $vpk = "$vidpid".ToLower()
+      if ($byVidPid.ContainsKey($vpk) -and $byVidPid[$vpk] -ne 'ambiguous') {
+        $holds = $byVidPid[$vpk]
+      }
       $out += [pscustomobject]@{
         BusId  = $bus
         VidPid = $vidpid
@@ -215,6 +284,8 @@ function Get-EnclosureFromTable {
         # A drive enclosure announces itself as mass storage. That is a better
         # signal than the vendor string, which is often a bare chipset name.
         IsMass = ($name -match 'Mass Storage|UAS|SCSI|Disk')
+        Holds  = $holds
+        DiskNumber = $(if ($holds) { $holds.DiskNumber } else { $null })
       }
     }
   }
@@ -244,7 +315,7 @@ if ($me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   Inf "  PowerShell with ${BD}Run as administrator${RS}, then run this again:"
   Inf "     $DIM$($MyInvocation.MyCommand.Path)$RS"
   Inf ''
-  Inf "  ${DIM}Or preview the plan from this shell:  .mfs-attach.ps1 -DryRun$RS"
+  Inf "  ${DIM}Or preview the plan from this shell:  .\vmfs-attach.ps1 -DryRun$RS"
   Write-Host ''
   exit 1
 }
@@ -437,21 +508,43 @@ if ($devs.Count -eq 0) {
 }
 
 Write-Host ''
-Write-Host "   $DIM  BUSID   VID:PID     STATE        DEVICE$RS"
+Write-Host "   $DIM  BUSID   VID:PID     STATE        HOLDS             DEVICE$RS"
 foreach ($d in $devs) {
   $mark = ' '
   if ($d.IsMass) { $mark = "$CY*$RS" }
   $col = ''
   if ($d.State -eq 'Attached') { $col = $GR } elseif ($d.State -eq 'Shared') { $col = $YL }
-  Write-Host ("   {0} {1,-7} {2,-11} {3}{4,-12}{5} {6}" -f $mark, $d.BusId, $d.VidPid, $col, $d.State, $RS, $d.Device)
+  # Naming the disk behind each bridge turns the riskiest guess in this script
+  # into something the table just answers. Drive letters are shown in red
+  # because a lettered disk is one Windows is actively using.
+  $holds = ''
+  $hcol = ''
+  if ($null -ne $d.DiskNumber) {
+    $holds = "disk $($d.DiskNumber)"
+    if ($d.Holds -and $d.Holds.Letters.Count) {
+      $holds = "$holds ($($d.Holds.Letters -join ','))"
+      $hcol = $RD
+    }
+    if ($d.DiskNumber -eq $DiskNumber) { $holds = "$holds <-"; $hcol = $CY }
+  }
+  Write-Host ("   {0} {1,-7} {2,-11} {3}{4,-12}{5} {6}{7,-17}{8} {9}" -f `
+      $mark, $d.BusId, $d.VidPid, $col, $d.State, $RS, $hcol, $holds, $RS, $d.Device)
 }
 Write-Host ''
 
 if (-not $BusId) {
   $mass = @($devs | Where-Object { $_.IsMass })
+  # Default to the enclosure that actually holds the disk chosen in step 1.
+  # Without the correlation the default was just the lowest mass storage busid,
+  # which on a two-enclosure bench is as likely to be the destination as the
+  # source.
+  $exact = @($devs | Where-Object { $null -ne $_.DiskNumber -and $_.DiskNumber -eq $DiskNumber })
   $default = ''
-  if ($mass.Count -ge 1) { $default = $mass[0].BusId }
-  if ($mass.Count -gt 1) {
+  if ($exact.Count -eq 1) { $default = $exact[0].BusId }
+  elseif ($mass.Count -ge 1) { $default = $mass[0].BusId }
+  if ($exact.Count -eq 1) {
+    Inf "${DIM}Busid $($exact[0].BusId) is the enclosure holding disk $DiskNumber.$RS"
+  } elseif ($mass.Count -gt 1) {
     Inf "${DIM}More than one mass storage device is listed. Pick the enclosure, not another external drive.$RS"
   }
   $prompt = 'BUSID of the enclosure'
@@ -462,6 +555,21 @@ if (-not $BusId) {
 $dev = $devs | Where-Object { $_.BusId -eq $BusId }
 if (-not $dev) { Die "BUSID $BusId is not in usbipd list." }
 Inf "Selected: ${BD}$BusId$RS  $DIM$($dev.VidPid)  $($dev.Device)$RS"
+
+# Attaching a device to WSL takes it away from Windows. Doing that to the disk
+# holding the copy destination does not just pick the wrong source: it removes
+# the target, and if a copy is already running it removes it mid-write. Since the
+# disk behind each bridge is now known, say so instead of letting it happen.
+if ($null -ne $dev.DiskNumber -and $dev.DiskNumber -ne $DiskNumber) {
+  Bad "Busid $BusId holds disk $($dev.DiskNumber), not disk $DiskNumber."
+  if ($dev.Holds -and $dev.Holds.Letters.Count) {
+    Inf "  ${DIM}Windows is using $($dev.Holds.Letters -join ', ') on it. Handing it to WSL takes those volumes away from Windows.$RS"
+  }
+  $cW = Ask 'Attach it anyway? [y/N]' 'n'
+  if ($cW -notmatch '^[yY]') { Die 'Aborted, nothing changed.' }
+} elseif ($null -eq $dev.DiskNumber -and $dev.IsMass) {
+  Note "Could not tell which disk is behind $BusId. Check it is the enclosure holding disk $DiskNumber."
+}
 
 # "Not shared" means usbipd has never claimed the device. bind is the one-time
 # step that makes it attachable at all, and it is the step most often skipped.

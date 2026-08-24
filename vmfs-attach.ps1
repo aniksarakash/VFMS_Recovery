@@ -132,6 +132,30 @@ function Wsl ([string] $Cmd) {
   return (& wsl.exe @a 2>&1)
 }
 
+# Anything with a shell variable in it has to travel as a file, not as an argument.
+# Something between PowerShell and bash eats $name and $1 out of the command line
+# while leaving $(...) alone, so a script passed to "bash -lc" arrives with every
+# variable reference blanked:
+#   for d in /proc/[0-9]*; do cat "$d/cmdline"   ->   cat "/cmdline"
+# It fails quietly, because a blanked variable is still valid shell. Every one line
+# command in this script is written without variables for that reason. Anything
+# longer goes through here instead: write it out with LF endings, hand bash the
+# path, and the text arrives byte for byte.
+function WslScript ([string] $Script) {
+  $tmp = Join-Path $env:TEMP ('vmfs-attach-' + [guid]::NewGuid().ToString('N') + '.sh')
+  # WriteAllText, not Set-Content: CRLF line endings would leave a carriage return
+  # on the end of every token bash reads.
+  [IO.File]::WriteAllText($tmp, ($Script -replace "`r`n", "`n"), (New-Object Text.UTF8Encoding $false))
+  $lin = $tmp -replace '\\', '/'
+  if ($lin -match '^([A-Za-z]):(.*)$') { $lin = '/mnt/' + $Matches[1].ToLower() + $Matches[2] }
+  try {
+    $a = @()
+    if ($Distro) { $a += @('-d', $Distro) }
+    $a += @('-u', 'root', '--', 'bash', $lin)
+    return (& wsl.exe @a 2>&1)
+  } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
+}
+
 # Whether $Path is usable, not merely listed. A FUSE mount has a third state that
 # two-way thinking misses: still in the kernel mount table, with no server left to
 # answer for it. "mountpoint -q" cannot see that state, because it stats the path,
@@ -165,6 +189,67 @@ function Clear-StaleMount ([string] $Path) {
   Wsl "mkdir -p -- '$Path' 2>/dev/null; exit 0" | Out-Null
 }
 
+# The drive and the enclosure are two devices, and every tool here mixes their
+# identities differently. A USB to NVMe bridge has to squeeze the drive's model
+# string into the SCSI INQUIRY vendor and product fields, 8 bytes and 16, so
+# "Force MP600" leaves the bridge as vendor "Force MP" and product "600". udev
+# then reads the drive underneath directly and publishes the whole string as
+# ID_MODEL, with the drive's own serial and firmware revision.
+#
+# Those two answers appear at different times. lsblk's MODEL, SERIAL and REV come
+# from the udev database, and udev is still processing the device for a moment
+# after the block node appears, which is exactly when this script used to ask. So
+# the same disk introduced itself as
+#   Force MP600 202882290001285556AE EGFM11.3     (udev finished first)
+#   600 1.00                                      (it did not)
+# and the name looked like it changed with every attach and detach. Wait for udev,
+# take its answer, and fall back to the raw fields only if it never arrives -
+# rejoining the split model string when the vendor field is full at all 8 bytes,
+# because that is what a split looks like.
+#
+# The enclosure is reported on its own line rather than folded in. Its serial is
+# the bridge's, not the drive's, and confusing the two is how a recovery ends up
+# pointed at the wrong disk.
+function Get-DriveIdentity ([string] $Base) {
+  $sh = @'
+udevadm settle -t 8 >/dev/null 2>&1
+udevadm info --query=property --name=/dev/__BASE__ 2>/dev/null |
+  grep -E '^(ID_MODEL|ID_SERIAL_SHORT|ID_REVISION|ID_USB_VENDOR_ID|ID_USB_MODEL_ID|ID_USB_SERIAL_SHORT)='
+echo "SYS_VENDOR=$(cat /sys/block/__BASE__/device/vendor 2>/dev/null)"
+echo "SYS_MODEL=$(cat /sys/block/__BASE__/device/model 2>/dev/null)"
+echo "SYS_REV=$(cat /sys/block/__BASE__/device/rev 2>/dev/null)"
+'@
+  $sh = $sh -replace '__BASE__', $Base
+  $p = @{}
+  foreach ($l in @(WslScript $sh)) {
+    if ("$l" -match '^([A-Z_]+)=(.*)$') { $p[$Matches[1]] = "$($Matches[2])".Trim() }
+  }
+
+  $model = ''; $fromUdev = $false
+  if ($p['ID_MODEL']) { $model = ($p['ID_MODEL'] -replace '_', ' ').Trim(); $fromUdev = $true }
+  else {
+    $v = "$($p['SYS_VENDOR'])"; $m = "$($p['SYS_MODEL'])"
+    # A vendor field that fills all 8 bytes is not a vendor name, it is the first
+    # 8 characters of something longer.
+    if ($v.Length -eq 8 -and $m) { $model = ($v + $m).Trim() }
+    else { $model = "$v $m".Trim() }
+  }
+  $rev = $p['ID_REVISION']; if (-not $rev) { $rev = $p['SYS_REV'] }
+
+  $bridge = ''
+  if ($p['ID_USB_VENDOR_ID'] -and $p['ID_USB_MODEL_ID']) {
+    $bridge = "$($p['ID_USB_VENDOR_ID']):$($p['ID_USB_MODEL_ID'])"
+  }
+  return [pscustomobject]@{
+    Model        = $model
+    Serial       = "$($p['ID_SERIAL_SHORT'])"
+    Firmware     = "$rev"
+    Bridge       = $bridge
+    BridgeSerial = "$($p['ID_USB_SERIAL_SHORT'])"
+    FromUdev     = $fromUdev
+  }
+}
+
 # A mount is not a property of the machine. It is a property of a mount namespace,
 # and WSL hands out more than one of them: the sessions this script drives through
 # wsl.exe do not always land in the same namespace as the WSL window the operator
@@ -196,7 +281,7 @@ done | awk -F'|' '!seen[$1]++'
 '@
   $sh = $sh -replace '__PATH__', $Path
   $out = @()
-  foreach ($l in @(Wsl $sh)) {
+  foreach ($l in @(WslScript $sh)) {
     $t = "$l".Trim()
     if ($t -notmatch '^mnt:\[') { continue }
     $f = $t -split '\|', 4
@@ -794,8 +879,27 @@ Ok "Disk is ${BD}/dev/$SdName$RS inside WSL."
 # two halves, so this line is the model string the drive actually reports, and it
 # is the one to trust if the Windows side above looked wrong.
 if (-not $DryRun) {
-  $id = "$(Wsl "lsblk -dn -o MODEL,SERIAL,REV /dev/$SdName 2>/dev/null | head -1")".Trim()
-  if ($id) { Inf "  ${DIM}Drive reports: $id$RS" }
+  $id = Get-DriveIdentity $SdName
+  if ($id.Model -or $id.Serial) {
+    $bits = @()
+    if ($id.Serial)   { $bits += "serial $($id.Serial)" }
+    if ($id.Firmware) { $bits += "fw $($id.Firmware)" }
+    $tail = ''
+    if ($bits.Count) { $tail = "  $DIM$($bits -join '  ')$RS" }
+    Inf "  Drive: ${BD}$($id.Model)$RS$tail"
+  }
+  if ($id.Bridge) {
+    $bs = ''
+    if ($id.BridgeSerial) { $bs = ", serial $($id.BridgeSerial)" }
+    # Named as the enclosure on purpose. This serial belongs to the bridge and
+    # stays the same when the drive inside it is swapped.
+    Inf "  ${DIM}Enclosure: $($id.Bridge) bridge$bs$RS"
+  }
+  if (-not $id.FromUdev -and $id.Model) {
+    Note 'udev had not finished with this device, so the name above is the raw bridge report.'
+    Inf "  ${DIM}Rejoined from the split vendor and product fields. Trust the size and the$RS"
+    Inf "  ${DIM}serial over the name, or rerun to get the drive's own model string.$RS"
+  }
 }
 if (-not $DryRun -and $script:SdAll.Count -gt 1) {
   $how = "are $(Human $DiskSize)"

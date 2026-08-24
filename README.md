@@ -681,6 +681,38 @@ A current `vmfs-attach.ps1 -Mount` checks for this before it claims success: it 
 </details>
 
 <details>
+<summary><strong>🔧 The drive reports a different model name on every attach</strong></summary>
+
+<br/>**Cause:** two devices, two identities, and a race between them. A USB-to-NVMe bridge has to fit the drive's model string into the SCSI INQUIRY vendor and product fields, 8 bytes and 16, so a `Force MP600` leaves the bridge split in half:
+
+```bash
+cat /sys/block/sdX/device/vendor   # Force MP     <- 8 bytes, full
+cat /sys/block/sdX/device/model    # 600
+cat /sys/block/sdX/device/rev      # 1.00         <- the bridge, not the drive
+```
+
+udev reads the drive underneath directly and publishes the whole string, along with the drive's own serial and firmware:
+
+```bash
+udevadm info --query=property --name=/dev/sdX | grep -E 'ID_MODEL|ID_SERIAL_SHORT|ID_REVISION'
+# ID_MODEL=Force_MP600
+# ID_SERIAL_SHORT=202882290001285556AE
+# ID_REVISION=EGFM11.3
+```
+
+`lsblk`'s `MODEL`, `SERIAL` and `REV` columns come from the udev database, and udev is still processing the device for a moment after the block node appears — which is exactly when a script that polls for `/dev/sdX` asks. Win the race and you get `Force MP600 202882290001285556AE EGFM11.3`; lose it and you get `600 1.00`. Same drive, same enclosure, different answer.
+
+**Fix:** a current `vmfs-attach.ps1` runs `udevadm settle` first, takes udev's answer, and only falls back to the raw fields if it never arrives — rejoining the halves when the vendor field is full at all 8 bytes, because that is what a split looks like. It also prints the enclosure on its own line, since `ID_USB_SERIAL_SHORT` is the **bridge's** serial and stays the same when you swap the drive inside it:
+
+```
+  Drive: Force MP600  serial 202882290001285556AE  fw EGFM11.3
+  Enclosure: 0bda:9210 bridge, serial 0129380055F9
+```
+
+Whatever the name says, identify the disk by **size and serial**. The `sdX` letter is not stable either: it is assigned in attach order and moves between runs.
+</details>
+
+<details>
 <summary><strong>🔧 <code>vmfs-attach.ps1</code> asks which disk to offline, and the VMFS disk isn't listed</strong></summary>
 
 <br/>**Cause:** the enclosure is *already* attached to WSL. `usbipd attach` removes the device from Windows, so `Get-Disk` cannot see that disk at all, and the list you're looking at is the other drives on the bench, one of which is your copy destination.

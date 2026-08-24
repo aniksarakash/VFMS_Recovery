@@ -41,6 +41,12 @@ BAR_W=38
 # Arg parsing
 #------------------------------------------------------------------------------
 usage() { sed -n '2,21p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0; }
+
+# Kept before the parser eats them, so any message that has to say "run this
+# again" can print the command the operator actually typed rather than a
+# reconstruction that quietly drops their other flags.
+ORIG_ARGS=("$@")
+
 while (($#)); do
   case $1 in
     --src)          SRC=${2:?missing value}; shift 2 ;;
@@ -146,24 +152,11 @@ attach_help() {
     ""
 }
 
-if [[ ! -d $SRC ]]; then
-  err "Source '$SRC' does not exist."
-  attach_help; exit 1
-fi
-[[ -d $DEST ]] || die "Destination '$DEST' does not exist. Try: sudo mkdir -p $DEST && sudo mount -t drvfs ${DEST##*/}: $DEST"
-
-if mountpoint -q "$SRC" 2>/dev/null; then
-  ok "Source mounted: ${B}$SRC${R}"
-elif [[ -z $(ls -A "$SRC" 2>/dev/null) ]]; then
-  # An empty $SRC is the common shape of every missed step above: the directory
-  # survives an unmount, so "it exists" proves nothing about the datastore.
-  err "Source '$SRC' exists but is empty - the datastore is not mounted."
-  attach_help; exit 1
-else
-  warn "Source '$SRC' is not a mountpoint but has content - continuing anyway."
-fi
-
-# Resolve how we escalate: already-root and --no-sudo both mean "call things directly".
+# Resolve how we escalate BEFORE anything tries to read the datastore. VMFS files
+# are mode 600 and the vmfs6-fuse mount is root-owned, so every read below goes
+# through $SUDO -- including the check that the source is readable at all. Doing
+# this second was the bug: the readability check ran unprivileged and concluded a
+# perfectly good datastore was missing.
 SUDO="sudo"
 if ((NO_SUDO)) || [[ ${EUID:-$(id -u)} -eq 0 ]]; then
   SUDO=""
@@ -172,12 +165,64 @@ elif ! command -v sudo >/dev/null 2>&1; then
   SUDO=""
   warn "sudo not found - continuing unprivileged. VMFS files are normally root-only (mode 600);"
   warn "if reads fail with 'Permission denied', rerun as root."
-elif sudo -v 2>/dev/null; then
+else
+  # -n first: it uses an already-cached credential and never prompts. Only fall
+  # back to the prompting form when a terminal is actually there to answer it --
+  # a bare "sudo -v" on a stdin nobody is watching blocks forever, which looks
+  # exactly like a hung scan of the datastore.
+  if sudo -n -v 2>/dev/null; then
+    :
+  elif [[ -t 0 ]]; then
+    sudo -v || die "sudo authentication failed. Rerun as root, or with --no-sudo if the source is readable."
+  else
+    die "sudo needs a password and there is no terminal to ask on.
+       Rerun as root: sudo $0${ORIG_ARGS[*]:+ ${ORIG_ARGS[*]}}"
+  fi
+  # Refresh the timestamp every 50s. A multi-hour ddrescue outlives the default
+  # 15-minute sudo timeout, and losing it mid-copy would stall on a prompt.
   ( while true; do sudo -n true 2>/dev/null; sleep 50; done ) & KEEPALIVE_PID=$!
   ok "sudo cached (VMFS files are root-only, mode 600)"
-else
-  die "sudo authentication failed. Rerun as root, or with --no-sudo if the source is readable."
 fi
+
+# Ask the kernel, not stat(). vmfs6-fuse mounts with user_id=0 and without
+# allow_other, so to anyone but root every path under the mountpoint fails with
+# EACCES -- which makes "[[ -d $SRC ]]" false and made this script announce a live
+# datastore as missing, then print the whole re-attach runbook for work that was
+# already done. /proc/mounts needs no privilege to read.
+src_is_mounted() {
+  awk -v want="$1" '$2 == want { hit = 1 } END { exit !hit }' /proc/mounts 2>/dev/null
+}
+
+if src_is_mounted "$SRC"; then
+  # Mounted and unreadable even through $SUDO is a permissions problem, never a
+  # missing datastore, so it must not print the attach runbook.
+  if ! $SUDO ls -A "$SRC" >/dev/null 2>&1; then
+    err "'$SRC' is mounted, but its contents cannot be read."
+    printf '\n  %s\n' "${B}This is a permissions problem, not a missing datastore.${R}"
+    printf '  %s\n' \
+      "vmfs6-fuse owns the mount as root and does not pass ${B}allow_other${R}, so" \
+      "reading it needs root. Rerun exactly as you did, with sudo:" \
+      "" \
+      "     ${CY}sudo $0${ORIG_ARGS[*]:+ ${ORIG_ARGS[*]}}${R}" \
+      "" \
+      "${DIM}Nothing needs reattaching or remounting - the datastore is already up.${R}" \
+      ""
+    exit 1
+  fi
+  ok "Source mounted: ${B}$SRC${R}"
+elif [[ ! -d $SRC ]]; then
+  err "Source '$SRC' does not exist."
+  attach_help; exit 1
+elif [[ -z $($SUDO ls -A "$SRC" 2>/dev/null) ]]; then
+  # An empty $SRC is the common shape of every missed step above: the directory
+  # survives an unmount, so "it exists" proves nothing about the datastore.
+  err "Source '$SRC' exists but is empty - the datastore is not mounted."
+  attach_help; exit 1
+else
+  warn "Source '$SRC' is not a mountpoint but has content - continuing anyway."
+fi
+
+[[ -d $DEST ]] || die "Destination '$DEST' does not exist. Try: sudo mkdir -p $DEST && sudo mount -t drvfs ${DEST##*/}: $DEST"
 
 command -v rsync >/dev/null 2>&1 \
   || die "rsync not found - it copies every .vmx/.nvram/.vmsd and any disk below the

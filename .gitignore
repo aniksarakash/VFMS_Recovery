@@ -1,0 +1,20 @@
+# ddrescue mapfiles and per-file logs — machine/run specific, can be huge
+*.map
+*.ddrescue.log
+vmfs-recovery/
+
+# recovered VM payloads must never be committed
+*.vmdk
+*.vmx
+*.nvram
+*.vmsd
+*.vswp
+*.vmem
+
+# superseded draft of the playbook (content now lives in README.md)
+README (3).md
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store

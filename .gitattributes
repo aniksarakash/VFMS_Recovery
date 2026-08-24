@@ -1,0 +1,10 @@
+# Shell scripts must stay LF — a CRLF checkout breaks them in WSL/Linux with
+# "bad interpreter: /usr/bin/env bash^M: no such file or directory"
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# Docs/config: normalize in the repo, LF on checkout
+*.md   text eol=lf
+LICENSE text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

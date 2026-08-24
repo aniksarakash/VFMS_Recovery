@@ -411,89 +411,110 @@ if ($Detach) {
 #==============================================================================
 # STEP 1. Offline the disk so Windows stops holding it.
 #==============================================================================
+# Rerunning this script after a successful attach is the natural thing to do --
+# it is how you add -Mount to an attach that already happened. Find out first,
+# because from here on Windows is not the source of truth about that disk.
+$preAtt = @(Get-Enclosure | Where-Object { $_.State -eq 'Attached' -and $_.IsMass })
+$AlreadyAttached = ($preAtt.Count -gt 0)
+
 Step '1.' 'Take the VMFS disk offline in Windows'
-
-$usb = @(Get-Disk | Where-Object { $_.BusType -eq 'USB' } | Sort-Object Number)
-if ($usb.Count -eq 0) {
-  Bad 'No USB disks found. Is the enclosure powered and plugged in?'
-  Inf "  ${DIM}A 3.5 inch enclosure usually needs its own power brick; bus power is not enough.$RS"
-  Write-Host ''; exit 1
-}
-
-$rows = @()
-foreach ($d in $usb) {
-  $parts = @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue)
-  $fs = @()
-  foreach ($p in $parts) {
-    $v = Get-Volume -Partition $p -ErrorAction SilentlyContinue
-    if ($v -and $v.FileSystem) { $fs += $v.FileSystem }
-  }
-  # The tell for a VMFS disk on Windows: partitions exist, but Windows recognises
-  # no filesystem in any of them and assigned no drive letter. That is the state
-  # that makes Windows offer to format the disk. The disk is fine. Windows simply
-  # has no VMFS driver.
-  $letters = @($parts | Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter })
-  $seen = 'none'
-  if ($fs.Count) { $seen = ($fs -join ',') } elseif ($parts.Count) { $seen = 'unreadable' }
-  $rows += [pscustomobject]@{
-    Disk    = $d.Number
-    Size    = (Human $d.Size)
-    Style   = $d.PartitionStyle
-    Parts   = $parts.Count
-    Windows = $seen
-    Offline = $d.IsOffline
-    Name    = $d.FriendlyName
-    Likely  = ($parts.Count -gt 0 -and $fs.Count -eq 0 -and $letters.Count -eq 0)
-  }
-}
-
-Write-Host ''
-Write-Host "   $DIM  #   SIZE     STYLE  PART  WINDOWS SEES  OFFLINE  MODEL$RS"
-foreach ($row in $rows) {
-  $mark = ' '
-  if ($row.Likely) { $mark = "$CY*$RS" }
-  Write-Host ("   {0} {1,-3} {2,-8} {3,-6} {4,-5} {5,-13} {6,-8} {7}" -f `
-      $mark, $row.Disk, $row.Size, $row.Style, $row.Parts, $row.Windows, $row.Offline, $row.Name)
-}
-Write-Host ''
-if ($rows | Where-Object { $_.Likely }) {
-  Inf "$CY*$RS $DIM= has partitions Windows cannot read, which is the expected shape of a VMFS disk.$RS"
-}
-
-if ($DiskNumber -lt 0) {
-  $guess = @($rows | Where-Object { $_.Likely })
-  $default = ''
-  if ($guess.Count -ge 1) { $default = "$($guess[0].Disk)" }
-  $prompt = 'Disk number to offline and pass to WSL'
-  if ($default) { $prompt = "$prompt [$default]" }
-  $ansD = Ask $prompt $default
-  if ([string]::IsNullOrWhiteSpace($ansD)) { Die 'No disk selected.' }
-  # A bare [int] cast on a typo threw a raw .NET conversion error at the user.
-  if ("$ansD" -notmatch '^\s*\d+\s*$') { Die "'$ansD' is not a disk number." }
-  $DiskNumber = [int]("$ansD".Trim())
-}
-$disk = $usb | Where-Object { $_.Number -eq $DiskNumber }
-if (-not $disk) { Die "Disk $DiskNumber is not a USB disk, or does not exist." }
-
-$chosen = $rows | Where-Object { $_.Disk -eq $DiskNumber }
-if ($chosen.Windows -ne 'unreadable' -and $chosen.Windows -ne 'none') {
-  Note "Windows reads a $($chosen.Windows) filesystem on disk $DiskNumber, which does not look like VMFS."
-  $c = Ask 'This may be the wrong disk. Continue anyway? [y/N]' 'n'
-  if ($c -notmatch '^[yY]') { Die 'Aborted, nothing changed.' }
-}
-$DiskSize = $disk.Size
-Inf "Selected: ${BD}disk $DiskNumber$RS  $($disk.FriendlyName)  $DIM$(Human $DiskSize)$RS"
-
-if ($disk.IsOffline) {
-  Ok "Disk $DiskNumber is already offline."
+if ($AlreadyAttached) {
+  # The enclosure is already handed to WSL, which means Windows cannot see this
+  # disk at all: it is absent from Get-Disk, so there is nothing here to offline.
+  # Left to run, this step listed only the OTHER disks on the bench and prompted
+  # for a number with no default -- on a recovery bench that is the copy
+  # destination, one keystroke away from being offlined.
+  Ok "$($preAtt[0].BusId) is already attached to WSL, so Windows no longer owns this disk."
+  Inf "  ${DIM}Nothing to offline. Skipping to the WSL side.$RS"
+  if (-not $BusId) { $BusId = $preAtt[0].BusId }
+  # Windows cannot report a size for a disk it does not own. Step 3 falls back
+  # to identifying the datastore by its VMFS signature when this is 0.
+  $DiskNumber = -1
+  $DiskSize   = 0
 } else {
-  if (Invoke-Step "offline disk $DiskNumber" { Set-Disk -Number $DiskNumber -IsOffline $true }) {
-    OkDid "Disk $DiskNumber offline. Windows has released it."
-  } else {
-    Bad 'Could not offline the disk.'
-    Inf '  Close anything reading it, then do it by hand:'
-    Inf "     $DIM diskpart  ->  list disk  ->  select disk $DiskNumber  ->  offline disk$RS"
+
+  $usb = @(Get-Disk | Where-Object { $_.BusType -eq 'USB' } | Sort-Object Number)
+  if ($usb.Count -eq 0) {
+    Bad 'No USB disks found. Is the enclosure powered and plugged in?'
+    Inf "  ${DIM}A 3.5 inch enclosure usually needs its own power brick; bus power is not enough.$RS"
     Write-Host ''; exit 1
+  }
+
+  $rows = @()
+  foreach ($d in $usb) {
+    $parts = @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue)
+    $fs = @()
+    foreach ($p in $parts) {
+      $v = Get-Volume -Partition $p -ErrorAction SilentlyContinue
+      if ($v -and $v.FileSystem) { $fs += $v.FileSystem }
+    }
+    # The tell for a VMFS disk on Windows: partitions exist, but Windows recognises
+    # no filesystem in any of them and assigned no drive letter. That is the state
+    # that makes Windows offer to format the disk. The disk is fine. Windows simply
+    # has no VMFS driver.
+    $letters = @($parts | Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter })
+    $seen = 'none'
+    if ($fs.Count) { $seen = ($fs -join ',') } elseif ($parts.Count) { $seen = 'unreadable' }
+    $rows += [pscustomobject]@{
+      Disk    = $d.Number
+      Size    = (Human $d.Size)
+      Style   = $d.PartitionStyle
+      Parts   = $parts.Count
+      Windows = $seen
+      Offline = $d.IsOffline
+      Name    = $d.FriendlyName
+      Likely  = ($parts.Count -gt 0 -and $fs.Count -eq 0 -and $letters.Count -eq 0)
+    }
+  }
+
+  Write-Host ''
+  Write-Host "   $DIM  #   SIZE     STYLE  PART  WINDOWS SEES  OFFLINE  MODEL$RS"
+  foreach ($row in $rows) {
+    $mark = ' '
+    if ($row.Likely) { $mark = "$CY*$RS" }
+    Write-Host ("   {0} {1,-3} {2,-8} {3,-6} {4,-5} {5,-13} {6,-8} {7}" -f `
+        $mark, $row.Disk, $row.Size, $row.Style, $row.Parts, $row.Windows, $row.Offline, $row.Name)
+  }
+  Write-Host ''
+  if ($rows | Where-Object { $_.Likely }) {
+    Inf "$CY*$RS $DIM= has partitions Windows cannot read, which is the expected shape of a VMFS disk.$RS"
+  }
+
+  if ($DiskNumber -lt 0) {
+    $guess = @($rows | Where-Object { $_.Likely })
+    $default = ''
+    if ($guess.Count -ge 1) { $default = "$($guess[0].Disk)" }
+    $prompt = 'Disk number to offline and pass to WSL'
+    if ($default) { $prompt = "$prompt [$default]" }
+    $ansD = Ask $prompt $default
+    if ([string]::IsNullOrWhiteSpace($ansD)) { Die 'No disk selected.' }
+    # A bare [int] cast on a typo threw a raw .NET conversion error at the user.
+    if ("$ansD" -notmatch '^\s*\d+\s*$') { Die "'$ansD' is not a disk number." }
+    $DiskNumber = [int]("$ansD".Trim())
+  }
+  $disk = $usb | Where-Object { $_.Number -eq $DiskNumber }
+  if (-not $disk) { Die "Disk $DiskNumber is not a USB disk, or does not exist." }
+
+  $chosen = $rows | Where-Object { $_.Disk -eq $DiskNumber }
+  if ($chosen.Windows -ne 'unreadable' -and $chosen.Windows -ne 'none') {
+    Note "Windows reads a $($chosen.Windows) filesystem on disk $DiskNumber, which does not look like VMFS."
+    $c = Ask 'This may be the wrong disk. Continue anyway? [y/N]' 'n'
+    if ($c -notmatch '^[yY]') { Die 'Aborted, nothing changed.' }
+  }
+  $DiskSize = $disk.Size
+  Inf "Selected: ${BD}disk $DiskNumber$RS  $($disk.FriendlyName)  $DIM$(Human $DiskSize)$RS"
+
+  if ($disk.IsOffline) {
+    Ok "Disk $DiskNumber is already offline."
+  } else {
+    if (Invoke-Step "offline disk $DiskNumber" { Set-Disk -Number $DiskNumber -IsOffline $true }) {
+      OkDid "Disk $DiskNumber offline. Windows has released it."
+    } else {
+      Bad 'Could not offline the disk.'
+      Inf '  Close anything reading it, then do it by hand:'
+      Inf "     $DIM diskpart  ->  list disk  ->  select disk $DiskNumber  ->  offline disk$RS"
+      Write-Host ''; exit 1
+    }
   }
 }
 
@@ -567,7 +588,7 @@ if ($null -ne $dev.DiskNumber -and $dev.DiskNumber -ne $DiskNumber) {
   }
   $cW = Ask 'Attach it anyway? [y/N]' 'n'
   if ($cW -notmatch '^[yY]') { Die 'Aborted, nothing changed.' }
-} elseif ($null -eq $dev.DiskNumber -and $dev.IsMass) {
+} elseif ($null -eq $dev.DiskNumber -and $dev.IsMass -and $DiskNumber -ge 0) {
   Note "Could not tell which disk is behind $BusId. Check it is the enclosure holding disk $DiskNumber."
 }
 
@@ -613,11 +634,24 @@ $script:SdName = ''
 $script:SdAll  = @()
 $found = Wait-For -Label 'block device appears in WSL' -Seconds $TimeoutSec -Test {
   $hits = @()
-  foreach ($l in @(Wsl 'lsblk -b -dn -o NAME,SIZE,TYPE 2>/dev/null')) {
-    if ("$l" -match '^\s*(\S+)\s+(\d+)\s+disk') {
-      $n = $Matches[1]; $sz = [long]$Matches[2]
-      # Tolerance: the size WSL reports can differ from Windows by a few sectors.
-      if ([math]::Abs($sz - $DiskSize) -lt 16MB) { $hits += $n }
+  if ($DiskSize -le 0) {
+    # No Windows-side size to match against, because Windows does not own the
+    # disk any more. Identify it by what is actually on it instead: lsblk names a
+    # VMFS member partition outright, which is a stronger signal than size ever
+    # was. -P quotes every field, so an empty column cannot shift the parse.
+    foreach ($l in @(Wsl 'lsblk -P -o NAME,FSTYPE,TYPE,PKNAME 2>/dev/null')) {
+      if ("$l" -match 'NAME="([^"]*)"\s+FSTYPE="VMFS_volume_member"\s+TYPE="part"\s+PKNAME="([^"]+)"') {
+        $hits += $Matches[2]
+      }
+    }
+    $hits = @($hits | Select-Object -Unique)
+  } else {
+    foreach ($l in @(Wsl 'lsblk -b -dn -o NAME,SIZE,TYPE 2>/dev/null')) {
+      if ("$l" -match '^\s*(\S+)\s+(\d+)\s+disk') {
+        $n = $Matches[1]; $sz = [long]$Matches[2]
+        # Tolerance: the size WSL reports can differ from Windows by a few sectors.
+        if ([math]::Abs($sz - $DiskSize) -lt 16MB) { $hits += $n }
+      }
     }
   }
   # Collect every match rather than taking the first. WSL's own virtual disks are
@@ -630,7 +664,8 @@ $SdName = $script:SdName
 if ($DryRun) {
   $SdName = 'sdX'
 } elseif (-not $found -or -not $SdName) {
-  Bad "No block device of size $(Human $DiskSize) showed up in WSL."
+  if ($DiskSize -le 0) { Bad 'No VMFS partition showed up in WSL.' }
+  else { Bad "No block device of size $(Human $DiskSize) showed up in WSL." }
   Inf '  What WSL can see right now:'
   foreach ($l in @(Wsl 'lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>&1')) { Inf "    $DIM$l$RS" }
   Inf ''
@@ -641,7 +676,9 @@ if ($DryRun) {
 }
 Ok "Disk is ${BD}/dev/$SdName$RS inside WSL."
 if (-not $DryRun -and $script:SdAll.Count -gt 1) {
-  Note "$($script:SdAll.Count) WSL disks are $(Human $DiskSize): $($script:SdAll -join ', '). Using /dev/$SdName."
+  $how = "are $(Human $DiskSize)"
+  if ($DiskSize -le 0) { $how = 'carry a VMFS partition' }
+  Note "$($script:SdAll.Count) WSL disks $($how): $($script:SdAll -join ', '). Using /dev/$SdName."
   Inf "  ${DIM}Confirm with 'wsl -u root -- lsblk' before copying. Writing to the wrong one is not recoverable.$RS"
 }
 
@@ -676,7 +713,7 @@ if (-not $Mount) {
   Inf "  ${BD}Next, inside WSL:$RS"
   Inf "     $DIM sudo mkdir -p $Src$RS"
   Inf "     $DIM sudo vmfs6-fuse /dev/$PartName $Src$RS"
-  Inf "     $DIM ./vmfs-copy.sh --src $Src --dest $Dest$RS"
+  Inf "     $DIM sudo ./vmfs-copy.sh --src $Src --dest $Dest$RS"
   Write-Host ''
   Inf "  ${DIM}Or rerun this with -Mount to do the mount from here.$RS"
   Write-Host ''
@@ -759,7 +796,11 @@ if ($DryRun) { Note 'Plan complete. Nothing was attached or mounted, because -Dr
 else { Ok 'Datastore is mounted and readable.' }
 Write-Host ''
 Inf "  ${BD}Next, inside WSL:$RS"
-Inf "     $DIM ./vmfs-copy.sh --src $Src --dest $Dest$RS"
+Inf "     $DIM sudo ./vmfs-copy.sh --src $Src --dest $Dest$RS"
+# Not decoration: without sudo the copier cannot read a single byte of the mount,
+# and the error it gets back is EACCES on every path, which reads like an empty
+# datastore rather than like a permissions problem.
+Inf "  ${DIM}vmfs6-fuse owns this mount as root, so the copier only reads it under sudo.$RS"
 Write-Host ''
 Inf "  ${DIM}When the copy is done, unwind cleanly with:$RS"
 Inf "     $DIM .\vmfs-attach.ps1 -Detach$RS"

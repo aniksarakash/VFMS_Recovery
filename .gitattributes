@@ -1,4 +1,4 @@
-# Shell scripts must stay LF — a CRLF checkout breaks them in WSL/Linux with
+# Shell scripts must stay LF, because a CRLF checkout breaks them in WSL/Linux with
 # "bad interpreter: /usr/bin/env bash^M: no such file or directory"
 *.sh   text eol=lf
 *.bash text eol=lf
@@ -10,3 +10,7 @@
 LICENSE text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
+
+# PowerShell reads LF fine, and keeping one line ending everywhere means the
+# repo never shows a whole-file diff just because a script was opened on Windows
+*.ps1  text eol=lf

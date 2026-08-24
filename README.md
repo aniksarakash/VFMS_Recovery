@@ -51,24 +51,24 @@
 <a id="tldr"></a>
 
 > [!NOTE]
-> **The 20-second version.** A drive that used to back a VMware **VMFS6** datastore is now sitting in a **USB enclosure**. Windows sees it but can't read the filesystem. This repo attaches it into **WSL2**, mounts it with `vmfs6-fuse`, then runs one interactive script — [`vmfs-copy.sh`](vmfs-copy.sh) — that **`ddrescue`s the big disk images** (retry + resume on bad sectors) and **`rsync`s the metadata**, with a **live progress bar, folder detection, and interactive selection**. Copy lands on your `D:` drive; then you register the VM on a fresh **ESXi 8** host. Every failure mode below actually happened during a real recovery.
+> **The 20-second version.** A drive that used to back a VMware **VMFS6** datastore is now sitting in a **USB enclosure**. Windows sees it but can't read the filesystem. This repo attaches it into **WSL2**, mounts it with `vmfs6-fuse`, then runs one interactive script, [`vmfs-copy.sh`](vmfs-copy.sh), that **`ddrescue`s the big disk images** (retry + resume on bad sectors) and **`rsync`s the metadata**, with a **live progress bar, folder detection, and interactive selection**. Copy lands on your `D:` drive; then you register the VM on a fresh **ESXi 8** host. Every failure mode below actually happened during a real recovery.
 
 <br/>
 
 ## 📌 What This Repository Is
 
-**VMFS Recovery** is a field-tested playbook plus one Bash script — [`vmfs-copy.sh`](vmfs-copy.sh) — for **recovering VMware virtual machines from a bare VMFS6 datastore disk**: a drive that has been physically pulled out of an ESXi host and plugged into a Windows PC through a USB enclosure.
+**VMFS Recovery** is a field-tested playbook plus two scripts, [`vmfs-attach.ps1`](vmfs-attach.ps1) for the Windows half and [`vmfs-copy.sh`](vmfs-copy.sh) for the Linux half, for **recovering VMware virtual machines from a bare VMFS6 datastore disk**: a drive that has been physically pulled out of an ESXi host and plugged into a Windows PC through a USB enclosure.
 
-**The problem.** Windows cannot read VMFS. There is no native Windows VMFS driver, so the disk shows up in Disk Management as a healthy partition with no drive letter, no recognized filesystem, and an offer to format it. Nothing on it is damaged — Windows simply doesn't speak the filesystem.
+**The problem.** Windows cannot read VMFS. There is no native Windows VMFS driver, so the disk shows up in Disk Management as a healthy partition with no drive letter, no recognized filesystem, and an offer to format it. Nothing on it is damaged. Windows simply doesn't speak the filesystem.
 
-**The method.** `usbipd-win` passes the USB disk through to **WSL2**, `vmfs6-fuse` mounts the VMFS6 volume inside Linux, and `vmfs-copy.sh` copies each VM folder out with the right tool per file: **`ddrescue`** for the multi-gigabyte `-flat.vmdk` disk images (bad-sector retries, resumable via mapfile) and **`rsync`** for the small `.vmx` / `.nvram` / descriptor files.
+**The method.** [`vmfs-attach.ps1`](vmfs-attach.ps1) offlines the disk in Windows and hands the enclosure to **WSL2** through `usbipd-win`, `vmfs6-fuse` mounts the VMFS6 volume inside Linux, and `vmfs-copy.sh` copies each VM folder out with the right tool per file: **`ddrescue`** for the multi-gigabyte `-flat.vmdk` disk images (bad-sector retries, resumable via mapfile) and **`rsync`** for the small `.vmx` / `.nvram` / descriptor files.
 
-**The result.** A complete, restorable VM folder on an ordinary NTFS drive, ready to register on a fresh **ESXi 8** host with `vim-cmd solo/registervm`. **No working hypervisor is needed to read the disk** — only WSL2.
+**The result.** A complete, restorable VM folder on an ordinary NTFS drive, ready to register on a fresh **ESXi 8** host with `vim-cmd solo/registervm`. **No working hypervisor is needed to read the disk**, only WSL2.
 
 **Who it's for.** Anyone holding a VMFS disk from a failed, decommissioned, or compromised ESXi host, with no running host left to plug it back into.
 
 > [!TIP]
-> **About the spelling.** The filesystem is **VMFS** — *Virtual Machine File System*. This repository's name transposes the letters as `VFMS_Recovery`. If you got here searching for **VFMS recovery**, **VMFS recovery** is the correct term, and this is the right place.
+> **About the spelling.** The filesystem is **VMFS**, *Virtual Machine File System*. This repository's name transposes the letters as `VFMS_Recovery`. If you got here searching for **VFMS recovery**, **VMFS recovery** is the correct term, and this is the right place.
 
 <br/>
 
@@ -84,6 +84,7 @@
 - [🧱 Prerequisites](#-prerequisites)
 - [🗺 The Process at a Glance](#-the-process-at-a-glance)
 - [⚡ Quick Start](#-quick-start)
+- [🪟 The Attach Script (Windows)](#-the-attach-script-windows)
 - [🖥 The Copier Script](#-the-copier-script)
 - [📖 Full Walkthrough](#-full-walkthrough)
 
@@ -108,17 +109,17 @@
 
 ## 🎯 When to Use This
 
-The drive is **no longer in an ESXi host** — it's out, in an enclosure, plugged into a USB port. Windows Disk Management shows it as a single healthy *"Primary Partition"* with **no drive letter and no recognized filesystem** (Windows can't read VMFS natively) and refuses to mount it. **That's the signal you're in the right place.**
+The drive is **no longer in an ESXi host**. It's out, in an enclosure, plugged into a USB port. Windows Disk Management shows it as a single healthy *"Primary Partition"* with **no drive letter and no recognized filesystem** (Windows can't read VMFS natively) and refuses to mount it. **That's the signal you're in the right place.**
 
 <div align="center">
 
 | You have… | This repo gives you… |
 |---|---|
 | 🔌 A bare VMFS drive in a USB enclosure | A WSL2 attach + mount recipe that actually works |
-| 💾 50–100 GB+ `-flat.vmdk` disk images | `ddrescue` with retries + a **resumable** mapfile |
+| 💾 50-100 GB+ `-flat.vmdk` disk images | `ddrescue` with retries + a **resumable** mapfile |
 | 🧩 Small `.vmx` / `.nvram` / descriptor files | `rsync`, fast, with swap/log files excluded |
 | ⚠ A drive with **bad sectors** | Sector-level recovery instead of a hard mid-copy fail |
-| 🧨 A crash / power-loss / WSL freeze mid-copy | A step-by-step **resume** sequence — never restarts from zero |
+| 🧨 A crash / power-loss / WSL freeze mid-copy | A step-by-step **resume** sequence, never restarts from zero |
 | 🚀 A fresh ESXi 8 host to restore onto | `vim-cmd` register + first-boot handling |
 
 </div>
@@ -134,12 +135,13 @@ The drive is **no longer in an ESXi host** — it's out, in an enclosure, plugge
 |---|---|---|---|
 | **`usbipd-win`** | Windows | Shares a USB device into WSL2's Linux kernel | `winget install usbipd` · or the [releases page](https://github.com/dorssel/usbipd-win/releases) |
 | **WSL2** (Ubuntu) | Windows | A real Linux kernel that can read VMFS | `wsl --install` |
-| **`vmfs6-fuse`** | WSL2 | FUSE driver to mount a VMFS6 volume | via `vmfs6-tools` — package manager first, else build from source |
+| **`vmfs6-fuse`** | WSL2 | FUSE driver to mount a VMFS6 volume | via `vmfs6-tools`, package manager first, else build from source |
 | **`gddrescue`** (→ `ddrescue`) | WSL2 | Sector-level recovery for a degrading drive | `sudo apt install gddrescue` |
 | **`rsync`** | WSL2 | Bulk copy for everything that isn't a giant image | usually preinstalled · else `sudo apt install rsync` |
+| **PowerShell** (admin) | Windows | Runs [`vmfs-attach.ps1`](vmfs-attach.ps1); `diskpart` and `usbipd` both need elevation | preinstalled · Windows PowerShell 5.1 or PowerShell 7+ |
 
 > [!TIP]
-> **Known-good enclosure fingerprint for this workflow: `0bda:9210`** (Realtek UAS bridge). A different VID:PID claiming to be mass storage — a `152d:0583` or `0bda:9201` decoy has shown up before — **is not it.** Always confirm the VID:PID in `usbipd list` before attaching.
+> **Known-good enclosure fingerprint for this workflow: `0bda:9210`** (Realtek UAS bridge). A different VID:PID claiming to be mass storage (a `152d:0583` or `0bda:9201` decoy has shown up before) **is not it.** Always confirm the VID:PID in `usbipd list` before attaching.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
@@ -154,7 +156,7 @@ flowchart TD
     D --> E["🪟 usbipd attach<br/>--wsl --busid X-Y"]
     E --> F["🐧 WSL: sleep 15; lsblk"]
     F --> G{"Real size shown?<br/>e.g. 931.5G"}
-    G -- "0B / missing" --> G1["Read-Capacity failure —<br/>reattach, wait longer"] --> E
+    G -- "0B / missing" --> G1["Read-Capacity failure,<br/>reattach, wait longer"] --> E
     G -- Yes --> H["🐧 sudo vmfs6-fuse<br/>/dev/sdX1 /mnt/vmfs"]
     H --> J["🐧 sudo ls -lh /mnt/vmfs"]
     J --> K["▶ ./vmfs-copy.sh"]
@@ -180,28 +182,121 @@ flowchart TD
 
 ## ⚡ Quick Start
 
-Already mounted the datastore and just want the files off it? Three lines:
+Two scripts, two shells. The Windows one attaches the disk, the Linux one copies the files.
+
+**1. Windows, in an administrator PowerShell.** Offlines the disk, hands the enclosure to WSL2, mounts the datastore:
+
+```powershell
+git clone https://github.com/aniksarakash/VFMS_Recovery.git
+cd VFMS_Recovery
+.\vmfs-attach.ps1 -Mount
+```
+
+**2. WSL, as your normal user.** Detect the VM folders, pick the ones you want, copy them:
 
 ```bash
-# 1) grab this repo inside WSL
-git clone https://github.com/aniksarakash/VFMS_Recovery.git && cd VFMS_Recovery
 chmod +x vmfs-copy.sh
-
-# 2) point it at the mount and your destination drive, then pick folders interactively
 ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
 ```
 
-Don't have it mounted yet? The **full attach → mount → copy** path is in the [walkthrough](#-full-walkthrough). The one-liner that mounts it:
+**3. When the copy is finished**, unwind cleanly from Windows:
+
+```powershell
+.\vmfs-attach.ps1 -Detach
+```
+
+Already have the datastore mounted? Go straight to step 2. Prefer to do the Windows half by hand? Every command is in the [walkthrough](#-full-walkthrough), and [the attach script](#-the-attach-script-windows) explains exactly what it is automating.
 
 ```bash
-sudo mkdir -p /mnt/vmfs && sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs   # sdX drifts — run lsblk first
+sudo mkdir -p /mnt/vmfs && sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs   # sdX drifts, run lsblk first
 ```
+
+<img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
+
+## 🪟 The Attach Script (Windows)
+
+[`vmfs-attach.ps1`](vmfs-attach.ps1) covers the half of the job the copier structurally cannot. `vmfs-copy.sh` runs **inside** WSL, and from in there it has no way to offline a Windows disk or bind a USB device to itself: `diskpart` and `usbipd` are Windows executables that need an elevated Windows shell. Those steps were manual, and a forgotten one looks exactly like an empty datastore.
+
+```powershell
+.\vmfs-attach.ps1 -Mount          # offline the disk, attach to WSL, mount VMFS6
+.\vmfs-attach.ps1 -DryRun         # show the plan, change nothing
+.\vmfs-attach.ps1 -Detach         # unmount, detach, bring the disk back online
+```
+
+> [!IMPORTANT]
+> It must run in an **administrator** PowerShell. Offlining a disk and binding a USB device are both privileged operations, and the script refuses to continue rather than failing halfway through.
+
+### What a run looks like
+
+Illustrative output, showing the two-enclosure case that makes manual attaching risky:
+
+```text
+  VMFS attach helper  (Windows side of the recovery)
+------------------------------------------------------------------------
+  [ok] Running elevated.
+  [ok] usbipd present: 4.3.0
+  [ok] WSL reachable.
+
+  1. Take the VMFS disk offline in Windows
+
+     #   SIZE     STYLE  PART  WINDOWS SEES  OFFLINE  MODEL
+   *  2   931G     GPT    1     unreadable    False    Realtek 9210 SCSI Disk Device
+      3   3.6T     GPT    2     NTFS          False    WD Elements 25A3
+
+   * = has partitions Windows cannot read, which is the expected shape of a VMFS disk.
+
+  Disk number to offline and pass to WSL [2]: 2
+  Selected: disk 2  Realtek 9210 SCSI Disk Device  931G
+  [ok] Disk 2 offline. Windows has released it.
+
+  2. Attach the enclosure to WSL with usbipd
+
+     BUSID   VID:PID     STATE        DEVICE
+   *  3-2     0bda:9210   Shared       USB Attached SCSI (UAS) Mass Storage Device
+   *  6-3     0bda:9201   Not shared   USB Attached SCSI (UAS) Mass Storage Device
+
+  More than one mass storage device is listed. Pick the enclosure, not another external drive.
+  BUSID of the enclosure [3-2]: 3-2
+  Selected: 3-2  0bda:9210  USB Attached SCSI (UAS) Mass Storage Device
+  Already bound (state: Shared).
+    [ok] usbipd reports 3-2 Attached (3s)
+
+  3. Locate the disk inside WSL
+    [ok] block device appears in WSL (6s)
+  [ok] Disk is /dev/sdd inside WSL.
+  [ok] Datastore partition: /dev/sdd1 (931G)
+
+  4. Mount the VMFS6 datastore
+  [ok] vmfs6-fuse present.
+  [ok] Mounted /dev/sdd1 at /mnt/vmfs.
+
+  3 entries on the datastore:
+    - IP_44.10_MyQ test Server
+    - IP_172.17.44.34_SQL
+    - Ticketing_System_Production Server
+
+------------------------------------------------------------------------
+  [ok] Datastore is mounted and readable.
+
+  Next, inside WSL:
+     ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
+```
+
+### The four things it does that a manual attach doesn't
+
+1. **Flags the likely VMFS disk instead of making you count.** The `*` marks any USB disk whose partitions exist but hold no filesystem Windows recognizes and no drive letter. That is precisely the state that makes Windows offer to format the disk, and it is the disk you want. If you pick one Windows *can* read, the script warns before touching it.
+2. **Matches the block device by size, not by name.** `sdX` letters are handed out in attach order, so yesterday's `/dev/sdd` is today's `/dev/sdc`. The script waits for a device whose size matches the Windows disk (within a few sectors) and reports the letter it actually found, then picks the largest partition on it.
+3. **Waits with a visible clock.** Attach and enumeration take anywhere from two to thirty seconds, because the enclosure has to spin up and re-enumerate. A spinner with elapsed seconds is the difference between "working" and "hung", and a timeout ends in a diagnosis rather than a hang: a device listed at `0B` means the enclosure dropped off the bus, which is almost always power.
+4. **Unwinds in the right order.** `-Detach` unmounts the FUSE mount first, then detaches the USB device, then brings the disk back online, and tells you which process is holding the mount if the unmount fails.
+
+> [!NOTE]
+> The script never formats, partitions, or writes to the source disk. The only changes it makes on Windows are the disk's online/offline state and the `usbipd` binding, both of which `-Detach` reverses.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
 ## 🖥 The Copier Script
 
-[`vmfs-copy.sh`](vmfs-copy.sh) is the heart of this repo — one interactive tool that **detects** every VM folder, lets you **select** which to pull, and copies each with the **right engine per file** and a **live progress bar**. It's built to be re-run: `ddrescue` mapfiles mean an interrupted copy **resumes**, it never restarts a disk image from zero.
+[`vmfs-copy.sh`](vmfs-copy.sh) is the heart of this repo, one interactive tool that **detects** every VM folder, lets you **select** which to pull, and copies each with the **right engine per file** and a **live progress bar**. It's built to be re-run: `ddrescue` mapfiles mean an interrupted copy **resumes**, it never restarts a disk image from zero.
 
 ### What a run looks like
 
@@ -234,7 +329,7 @@ sudo mkdir -p /mnt/vmfs && sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs   # sdX drifts �
 
 <div align="center">
 
-`absent` · `partial 38%` · `complete` — the **DEST** column tells you at a glance what's already been copied, so a resumed run only touches what's left.
+`absent` · `partial 38%` · `complete`, the **DEST** column tells you at a glance what's already been copied, so a resumed run only touches what's left.
 
 </div>
 
@@ -256,19 +351,22 @@ flowchart LR
     class DD a; class RS a; class EX c; class V,DONE b;
 ```
 
-1. **`ddrescue` for the big disk images** — retries and works *around* bad sectors instead of failing the whole file. The mapfile records exactly what's been read, so a re-run resumes.
-2. **`rsync` for everything small** — running `ddrescue` file-by-file on a 4 KB `.vmx` gains nothing; `rsync` is faster and handles them in one shot.
-3. **Excludes what a restore doesn't need** — `*.vswp` swap and `*.log` files are skipped by default (keep the logs with `--keep-logs`).
+1. **`ddrescue` for the big disk images**: retries and works *around* bad sectors instead of failing the whole file. The mapfile records exactly what's been read, so a re-run resumes.
+2. **`rsync` for everything small**, running `ddrescue` file-by-file on a 4 KB `.vmx` gains nothing; `rsync` is faster and handles them in one shot.
+3. **Excludes what a restore doesn't need**, `*.vswp` swap and `*.log` files are skipped by default (keep the logs with `--keep-logs`).
 
 > [!TIP]
-> **Test the plan before committing to it:** `./vmfs-copy.sh --dry-run` prints the detection table, the space check, and exactly what *would* be copied — and stops. Nothing is written.
+> **Test the plan before committing to it:** `./vmfs-copy.sh --dry-run` prints the detection table, the space check, and exactly what *would* be copied, and stops. Nothing is written.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
 ## 📖 Full Walkthrough
 
 <details open>
-<summary><strong>Step 1 — Identify &amp; offline the drive (Windows)</strong></summary>
+<summary><strong>Step 1: Identify &amp; offline the drive (Windows)</strong></summary>
+
+> [!TIP]
+> [`vmfs-attach.ps1`](vmfs-attach.ps1) does this whole step, including working out which disk is the VMFS one. What follows is the manual equivalent, worth reading once so you know what the script is doing on your behalf.
 
 <br/>
 
@@ -286,12 +384,15 @@ DISKPART> offline disk
 ```
 
 > [!IMPORTANT]
-> The disk number isn't fixed — confirm it against the **size** (e.g. 931 GB) in `list disk` every time. Don't assume it's always `disk 1`.
+> The disk number isn't fixed. Confirm it against the **size** (e.g. 931 GB) in `list disk` every time. Don't assume it's always `disk 1`.
 
 </details>
 
 <details>
-<summary><strong>Step 2 — Attach to WSL2</strong></summary>
+<summary><strong>Step 2: Attach to WSL2</strong></summary>
+
+> [!TIP]
+> `.mfs-attach.ps1` does steps 1 and 2 in one pass, and waits for the device to finish enumerating instead of leaving you to guess how long that takes.
 
 <br/>
 
@@ -306,19 +407,22 @@ sleep 15
 lsblk
 ```
 
-You want the drive at its **real size** (e.g. `931.5G`), not `0B`. A partition like `sdd1` with no mountpoint yet is correct here — attached but not mounted.
+You want the drive at its **real size** (e.g. `931.5G`), not `0B`. A partition like `sdd1` with no mountpoint yet is correct here: attached but not mounted.
 
 </details>
 
 <details>
-<summary><strong>Step 3 — Mount the VMFS volume</strong></summary>
+<summary><strong>Step 3: Mount the VMFS volume</strong></summary>
+
+> [!TIP]
+> `.mfs-attach.ps1 -Mount` does this step as well, installs `vmfs6-tools` if it is missing, and lists the datastore contents afterwards as proof the mount actually worked.
 
 <br/>
 
 ```bash
 sudo mkdir -p /mnt/vmfs
 sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs
-sudo ls -lh /mnt/vmfs          # always sudo — the VM files are root-only
+sudo ls -lh /mnt/vmfs          # always sudo, the VM files are root-only
 ```
 
 A `Lun ID mismatch` warning here is **expected and harmless** (see [Troubleshooting](#-troubleshooting-reference)).
@@ -326,7 +430,7 @@ A `Lun ID mismatch` warning here is **expected and harmless** (see [Troubleshoot
 </details>
 
 <details>
-<summary><strong>Step 4 — Run the copier</strong></summary>
+<summary><strong>Step 4: Run the copier</strong></summary>
 
 <br/>
 
@@ -353,7 +457,7 @@ sudo rsync -avh --progress "$SRC/$folder/" "$DEST/$folder/" \
 </details>
 
 <details>
-<summary><strong>Step 5 — Verify</strong></summary>
+<summary><strong>Step 5: Verify</strong></summary>
 
 <br/>
 
@@ -376,7 +480,7 @@ sudo du -sh "/mnt/d/$folder"
 
 ## ♻ Recovering After a Crash, Power Loss, or WSL Restart
 
-Running multiple `ddrescue`/`rsync` jobs at once against a USB-attached drive, through WSL2's virtualized USB stack, is more fragile than it looks — in practice it has hung WSL and browned out a bus-powered enclosure under combined current draw. This is the recovery sequence, **in order** — each step assumes the previous one is confirmed working.
+Running multiple `ddrescue`/`rsync` jobs at once against a USB-attached drive, through WSL2's virtualized USB stack, is more fragile than it looks. In practice it has hung WSL and browned out a bus-powered enclosure under combined current draw. This is the recovery sequence, **in order**. Each step assumes the previous one is confirmed working.
 
 ```mermaid
 flowchart TD
@@ -384,10 +488,10 @@ flowchart TD
     B --> C{"WSL still Running?"}
     C -- "No / stuck" --> D["wsl --shutdown, wait ~10s"]
     C -- Yes --> D
-    D --> E["🪟 usbipd list —<br/>reattach source if needed"]
-    E --> F["🐧 sleep 15; lsblk —<br/>note the CURRENT sdX,<br/>it may have drifted"]
+    D --> E["🪟 usbipd list,<br/>reattach source if needed"]
+    E --> F["🐧 sleep 15; lsblk,<br/>note the CURRENT sdX,<br/>it may have drifted"]
     F --> G["🐧 remount:<br/>sudo vmfs6-fuse /dev/sdX1 /mnt/vmfs"]
-    G --> H["🐧 sudo ls -lh /mnt/vmfs —<br/>all folders present?"]
+    G --> H["🐧 sudo ls -lh /mnt/vmfs,<br/>all folders present?"]
     H --> I{"Did the DESTINATION<br/>drive lose power?"}
     I -- Yes --> J["🪟 chkdsk D: /f"]
     J --> K{"Clean?"}
@@ -396,7 +500,7 @@ flowchart TD
     I -- No --> L
     L --> M{"'No such device'?"}
     M -- Yes --> N["sudo mount -t drvfs D: /mnt/d"] --> L
-    M -- "lists fine" --> O["▶ ./vmfs-copy.sh — same flags.<br/>Detection shows 'partial %',<br/>ddrescue resumes from mapfile"]
+    M -- "lists fine" --> O["▶ ./vmfs-copy.sh, same flags.<br/>Detection shows 'partial %',<br/>ddrescue resumes from mapfile"]
 
     classDef win fill:#0F2027,stroke:#0078D6,color:#fff;
     classDef nix fill:#1b2b34,stroke:#39BAE6,color:#fff;
@@ -405,18 +509,18 @@ flowchart TD
 ```
 
 > [!NOTE]
-> **Why resuming is safe.** `ddrescue` reads its mapfile and only re-attacks sectors not already marked rescued; `rsync` only re-sends files that are missing or changed. Neither restarts from zero. What breaks in a crash isn't the recovery logic — it's the layers underneath (WSL's VM state, the drvfs bridge, the USB attachment, enclosure power) that need re-establishing.
+> **Why resuming is safe.** `ddrescue` reads its mapfile and only re-attacks sectors not already marked rescued; `rsync` only re-sends files that are missing or changed. Neither restarts from zero. What breaks in a crash isn't the recovery logic; it's the layers underneath (WSL's VM state, the drvfs bridge, the USB attachment, enclosure power) that need re-establishing.
 
 > [!CAUTION]
-> **If the destination drive lost power specifically,** a clean `chkdsk /f` confirms the filesystem structure — but *not* that the file being written at the crash is complete to the last byte (a hard power loss can drop the drive's write cache). Treat `bad areas: 0` after resuming, or a final size match against the source, as the real confirmation — not chkdsk alone.
+> **If the destination drive lost power specifically,** a clean `chkdsk /f` confirms the filesystem structure, but *not* that the file being written at the crash is complete to the last byte (a hard power loss can drop the drive's write cache). Treat `bad areas: 0` after resuming, or a final size match against the source, as the real confirmation, not chkdsk alone.
 
-**One habit that prevents most of the confusion here:** run `lsblk` fresh immediately before referencing any `/dev/sdX` path. Device letters drift across detach/reattach cycles — a path that was `sdd1` earlier may be `sde1` later for the exact same physical drive.
+**One habit that prevents most of the confusion here:** run `lsblk` fresh immediately before referencing any `/dev/sdX` path. Device letters drift across detach/reattach cycles; a path that was `sdd1` earlier may be `sde1` later for the exact same physical drive.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
 ## 🚀 Restoring on ESXi 8
 
-After the copy, each recovered folder should hold: the small text descriptor `VMName.vmdk`, the large `VMName-flat.vmdk`, `VMName.vmx`, `VMName.nvram`, maybe `.vmsd`. (The script excludes `*.vswp` swap and `*.log`; keep logs with `--keep-logs` — harmless, just not needed.)
+After the copy, each recovered folder should hold: the small text descriptor `VMName.vmdk`, the large `VMName-flat.vmdk`, `VMName.vmx`, `VMName.nvram`, maybe `.vmsd`. (The script excludes `*.vswp` swap and `*.log`; keep logs with `--keep-logs`, harmless, just not needed.)
 
 ```mermaid
 flowchart LR
@@ -424,7 +528,7 @@ flowchart LR
     B --> C["📝 Register the VM<br/>vim-cmd / Host Client"]
     C --> D{"'Copied' or 'Moved'<br/>on first boot?"}
     D -- "Copied ✅ (safe default)" --> E["Fresh UUID + MAC"]
-    D -- Moved --> F["Keeps identity —<br/>only if no conflict"]
+    D -- Moved --> F["Keeps identity,<br/>only if no conflict"]
     E --> G["🔌 Reattach NIC to a<br/>valid portgroup"]
     F --> G
     G --> H{"Tied to a<br/>security incident?"}
@@ -441,10 +545,10 @@ flowchart LR
 **1. Get the files onto the datastore.**
 
 ```bash
-# Option A — scp (enable SSH: Host Client → Manage → Services → TSM-SSH → Start)
+# Option A: scp (enable SSH: Host Client → Manage → Services → TSM-SSH → Start)
 scp -r "/mnt/d/IP_44.10_MyQ test Server" root@<esxi-host-ip>:/vmfs/volumes/<datastore>/
 ```
-*Option B* — Host Client → Storage → Datastore Browser → **Upload Folder**. Simpler for a one-off, slower for very large files.
+*Option B*: Host Client → Storage → Datastore Browser → **Upload Folder**. Simpler for a one-off, slower for very large files.
 
 **2. Register the VM** (so ESXi uses the recovered disk, not a blank one from the New VM wizard):
 
@@ -459,11 +563,11 @@ vim-cmd vmsvc/getallvms
 vim-cmd vmsvc/power.on <Vmid>
 ```
 
-- Asked **copied vs moved**? Choose **"I copied it"** unless it's a guaranteed 1:1 replacement — "copied" issues a fresh UUID/MAC and avoids conflicts.
-- The NIC will likely show disconnected (the old portgroup doesn't exist here) — fix under VM Settings → Network Adapter.
+- Asked **copied vs moved**? Choose **"I copied it"** unless it's a guaranteed 1:1 replacement; "copied" issues a fresh UUID/MAC and avoids conflicts.
+- The NIC will likely show disconnected (the old portgroup doesn't exist here); fix under VM Settings → Network Adapter.
 - A hardware-compatibility complaint → use **Upgrade VM Compatibility**, don't rebuild.
 
-**4. If the descriptor `.vmdk` is missing or suspect,** regenerate it against the flat file rather than hand-editing geometry — this doubles as an integrity check:
+**4. If the descriptor `.vmdk` is missing or suspect,** regenerate it against the flat file rather than hand-editing geometry; this doubles as an integrity check:
 
 ```bash
 vmkfstools -i "/vmfs/volumes/<datastore>/VMName/VMName.vmdk" \
@@ -471,7 +575,7 @@ vmkfstools -i "/vmfs/volumes/<datastore>/VMName/VMName.vmdk" \
 ```
 
 > [!WARNING]
-> **Security-incident note.** If this is incident response rather than a plain hardware failure, don't plug the restored VM straight into production. Power it on with the NIC on an **isolated/quarantine** portgroup, let it get scanned, then reconnect. And if any `-flat.vmdk` had a non-zero `errsize`, expect some in-guest damage — run `chkdsk /f` (Windows guest) or `fsck` (Linux) after boot to contain it.
+> **Security-incident note.** If this is incident response rather than a plain hardware failure, don't plug the restored VM straight into production. Power it on with the NIC on an **isolated/quarantine** portgroup, let it get scanned, then reconnect. And if any `-flat.vmdk` had a non-zero `errsize`, expect some in-guest damage; run `chkdsk /f` (Windows guest) or `fsck` (Linux) after boot to contain it.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
@@ -483,9 +587,9 @@ vmkfstools -i "/vmfs/volumes/<datastore>/VMName/VMName.vmdk" \
 <br/>**Cause:** the kernel hasn't finished enumerating the device, or it attached in a mode that triggers a `Read Capacity` failure.
 
 **Fix:**
-- Wait longer — `sleep 15`, sometimes 20–30s on a slower enclosure.
+- Wait longer: `sleep 15`, sometimes 20-30s on a slower enclosure.
 - Detach/reattach: `usbipd detach --busid X-Y`, then `usbipd attach --wsl --busid X-Y`.
-- Check enumeration in `usbipd list`. A plain `USB Mass Storage Device` (legacy mode) has been more failure-prone than `USB Attached SCSI (UAS) Mass Storage Device` — **UAS mode is the reliable one** for this enclosure.
+- Check enumeration in `usbipd list`. A plain `USB Mass Storage Device` (legacy mode) has been more failure-prone than `USB Attached SCSI (UAS) Mass Storage Device`. **UAS mode is the reliable one** for this enclosure.
 </details>
 
 <details>
@@ -493,15 +597,15 @@ vmkfstools -i "/vmfs/volumes/<datastore>/VMName/VMName.vmdk" \
 
 <br/>**Cause:** a USB bus re-enumeration hiccup, usually right after a Windows-side disk state change like offlining it in `diskpart`.
 
-**Fix:** physically unplug and replug the enclosure, then `usbipd list` again. Confirm the VID:PID before attaching — this enclosure is **`0bda:9210`**. A different device coincidentally showing as mass storage isn't it.
+**Fix:** physically unplug and replug the enclosure, then `usbipd list` again. Confirm the VID:PID before attaching: this enclosure is **`0bda:9210`**. A different device coincidentally showing as mass storage isn't it.
 </details>
 
 <details>
 <summary><strong>🔧 Permission denied on <code>ls /mnt/vmfs</code> right after mounting</strong></summary>
 
-<br/>**Cause:** the mount was done with `sudo`, so the FUSE mount is root-owned with `default_permissions`, and the VM files underneath are `-rw-------` (mode 600) — normal for VMFS.
+<br/>**Cause:** the mount was done with `sudo`, so the FUSE mount is root-owned with `default_permissions`, and the VM files underneath are `-rw-------` (mode 600), normal for VMFS.
 
-**Fix:** nothing's broken — prefix every command touching `/mnt/vmfs` with `sudo`. (`vmfs-copy.sh` does this for you, and caches the sudo timestamp so it won't re-prompt mid-copy.)
+**Fix:** nothing's broken; prefix every command touching `/mnt/vmfs` with `sudo`. (`vmfs-copy.sh` does this for you, and caches the sudo timestamp so it won't re-prompt mid-copy.)
 </details>
 
 <details>
@@ -509,19 +613,19 @@ vmkfstools -i "/vmfs/volumes/<datastore>/VMName/VMName.vmdk" \
 
 <br/>**Cause:** the volume's metadata still carries the LUN ID from the original host's controller, which won't match a USB enclosure. Expected any time you read a VMFS volume through different hardware than it was created on.
 
-**Fix:** none needed — it's a warning, not a failure. The mount proceeds.
+**Fix:** none needed, it's a warning, not a failure. The mount proceeds.
 </details>
 
 <details>
 <summary><strong>🔧 rsync (or cp) dies mid-transfer with an I/O error / "file has vanished"</strong></summary>
 
-<br/>**Cause:** a physically bad sector on the source. `rsync`/`cp` don't retry — they fail the file and stop.
+<br/>**Cause:** a physically bad sector on the source. `rsync`/`cp` don't retry; they fail the file and stop.
 
-**Fix:** confirm with `dmesg | tail -30` (a repeated I/O error at the same LBA). Switch that one file to `ddrescue` — which is exactly what `vmfs-copy.sh` already routes every `-flat.vmdk` through:
+**Fix:** confirm with `dmesg | tail -30` (a repeated I/O error at the same LBA). Switch that one file to `ddrescue`, which is exactly what `vmfs-copy.sh` already routes every `-flat.vmdk` through:
 ```bash
 sudo ddrescue -v -b 512 --retry-passes=3 "SOURCE" "DEST" "MAPFILE.map"
 ```
-Everything that already copied cleanly stays copied — no need to redo it.
+Everything that already copied cleanly stays copied; no need to redo it.
 </details>
 
 <details>
@@ -530,9 +634,9 @@ Everything that already copied cleanly stays copied — no need to redo it.
 <br/>**Cause:** some sectors are permanently unreadable even after retries.
 
 **Options:**
-- Re-run the exact same command / re-run `vmfs-copy.sh` — it resumes from the mapfile and only re-attacks bad areas, so another pass is cheap.
+- Re-run the exact same command / re-run `vmfs-copy.sh`; it resumes from the mapfile and only re-attacks bad areas, so another pass is cheap.
 - Two-phase for a large file: a fast `ddrescue -n` pass (no retries, grabs everything easy), then a focused retry pass on the same mapfile.
-- If it stays non-zero, that data is gone. The mapfile records exactly which regions — repair the rest in-guest post-restore with `chkdsk`/`fsck`.
+- If it stays non-zero, that data is gone. The mapfile records exactly which regions; repair the rest in-guest post-restore with `chkdsk`/`fsck`.
 </details>
 
 <details>
@@ -550,21 +654,21 @@ sudo mount -t drvfs D: /mnt/d
 <details>
 <summary><strong>🔧 WSL becomes unresponsive after multiple concurrent jobs</strong></summary>
 
-<br/>**Cause:** several I/O-heavy jobs in parallel through WSL2's virtualized USB stack is fragile — it can hang the WSL VM itself.
+<br/>**Cause:** several I/O-heavy jobs in parallel through WSL2's virtualized USB stack is fragile; it can hang the WSL VM itself.
 
-**Fix:** from Windows, `wsl --list --verbose` to check whether WSL is actually still running (sometimes it's just the terminal that's stuck). If it's genuinely hung, `wsl --shutdown` resets cleanly — then follow [Recovering After a Crash](#-recovering-after-a-crash-power-loss-or-wsl-restart). Nothing already on disk is lost.
+**Fix:** from Windows, `wsl --list --verbose` to check whether WSL is actually still running (sometimes it's just the terminal that's stuck). If it's genuinely hung, `wsl --shutdown` resets cleanly, then follow [Recovering After a Crash](#-recovering-after-a-crash-power-loss-or-wsl-restart). Nothing already on disk is lost.
 
-**Prevention:** one copy operation at a time against a given physical drive — which is exactly how `vmfs-copy.sh` runs by design (folders are processed sequentially, never in parallel).
+**Prevention:** one copy operation at a time against a given physical drive, which is exactly how `vmfs-copy.sh` runs by design (folders are processed sequentially, never in parallel).
 </details>
 
 <details>
 <summary><strong>🔧 The USB enclosure disconnects mid-copy (drive drops out)</strong></summary>
 
-<br/>**Cause:** often power, not software — a spinning HDD under multiple concurrent read streams draws more current than one sequential stream. A bus-powered enclosure on a marginal supply can brown out.
+<br/>**Cause:** often power, not software: a spinning HDD under multiple concurrent read streams draws more current than one sequential stream. A bus-powered enclosure on a marginal supply can brown out.
 
-**Fix:** reconnect (`usbipd list` → `usbipd attach`), then confirm with `dmesg -T | tail -50` — look for I/O errors or a device reset around that time, and nothing repeating after.
+**Fix:** reconnect (`usbipd list` → `usbipd attach`), then confirm with `dmesg -T | tail -50`: look for I/O errors or a device reset around that time, and nothing repeating after.
 
-**Prevention:** use the enclosure's own power adapter; if bus-powered only, route through a *powered* USB hub. Short, known-good cable. And one job at a time — the script already enforces that.
+**Prevention:** use the enclosure's own power adapter; if bus-powered only, route through a *powered* USB hub. Short, known-good cable. And one job at a time; the script already enforces that.
 </details>
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
@@ -584,7 +688,7 @@ The literal strings this recovery produces, so you can match what's on your scre
 | `ls: cannot access '/mnt/d': No such device` | destination | WSL's `drvfs` bridge to the Windows drive dropped | `sudo mount -t drvfs D: /mnt/d` |
 | `/dev/sdd1 does not exist` | remount after a crash | The device letter drifted across reattach | Run `lsblk` fresh and use the **current** `sdX` |
 | `/usr/bin/env: 'bash\r': No such file or directory` | running the script | The file was saved with Windows CRLF line endings | `sed -i 's/\r$//' vmfs-copy.sh` (this repo pins LF via `.gitattributes`) |
-| `The disk is offline because of policy set by an administrator` | Windows `diskpart` | Expected — you offlined it on purpose so WSL can claim it | Nothing; this is the goal |
+| `The disk is offline because of policy set by an administrator` | Windows `diskpart` | Expected, you offlined it on purpose so WSL can claim it | Nothing; this is the goal |
 | `This virtual machine might have been moved or copied` | ESXi first boot | ESXi noticed a new UUID/path | Answer **"I copied it"** unless it's a guaranteed 1:1 replacement |
 | `Failed to lock the file` | ESXi power-on | The disk is already registered or held by another VM | Unregister the duplicate, then power on |
 
@@ -594,7 +698,7 @@ The literal strings this recovery produces, so you can match what's on your scre
 
 ### Can Windows read a VMFS drive?
 
-No. Windows has no native VMFS driver, so a VMFS disk appears in Disk Management as a healthy partition with **no drive letter and no recognized filesystem**, and Windows offers to format it. Nothing is wrong with the disk — Windows just can't parse VMFS. **Do not let it format the disk.** Read it from Linux instead: this repo passes the disk into WSL2 and mounts it with `vmfs6-fuse`.
+No. Windows has no native VMFS driver, so a VMFS disk appears in Disk Management as a healthy partition with **no drive letter and no recognized filesystem**, and Windows offers to format it. Nothing is wrong with the disk. Windows just can't parse VMFS. **Do not let it format the disk.** Read it from Linux instead: this repo passes the disk into WSL2 and mounts it with `vmfs6-fuse`.
 
 ### How do I mount a VMFS6 datastore on Windows 11?
 
@@ -602,7 +706,7 @@ Through WSL2, in four steps: offline the disk in `diskpart` so Windows releases 
 
 ### Can I recover VMs from a VMFS disk without an ESXi host?
 
-Yes. You never need a hypervisor to *read* the disk — `vmfs6-fuse` in WSL2 is enough to mount the datastore and copy the VM folders off. You only need an ESXi host at the end, to *run* the recovered VM. The recovered folder is ordinary files, so you can keep it on an NTFS drive indefinitely and restore it whenever a host is available.
+Yes. You never need a hypervisor to *read* the disk, `vmfs6-fuse` in WSL2 is enough to mount the datastore and copy the VM folders off. You only need an ESXi host at the end, to *run* the recovered VM. The recovered folder is ordinary files, so you can keep it on an NTFS drive indefinitely and restore it whenever a host is available.
 
 ### Should I use ddrescue or rsync to copy a VMDK?
 
@@ -610,11 +714,11 @@ Use **`ddrescue` for the large `-flat.vmdk` disk images** and **`rsync` for ever
 
 ### How do I resume an interrupted ddrescue copy?
 
-Re-run the **exact same command with the same mapfile path**. `ddrescue` reads the mapfile, skips every range already marked rescued, and attacks only the gaps. Re-running `vmfs-copy.sh` with the same flags does this automatically. The one thing that breaks resume is losing the mapfile — which is why this script keeps mapfiles next to the **destination** (`<dest>/.vmfs-recovery`) rather than under `$HOME`, since running under `sudo` changes `$HOME` to `/root` and would look in the wrong directory.
+Re-run the **exact same command with the same mapfile path**. `ddrescue` reads the mapfile, skips every range already marked rescued, and attacks only the gaps. Re-running `vmfs-copy.sh` with the same flags does this automatically. The one thing that breaks resume is losing the mapfile, which is why this script keeps mapfiles next to the **destination** (`<dest>/.vmfs-recovery`) rather than under `$HOME`, since running under `sudo` changes `$HOME` to `/root` and would look in the wrong directory.
 
 ### Does resuming a ddrescue copy re-read everything first?
 
-No, and it doesn't take twice as long. Already-rescued ranges are skipped without being read or rewritten — a resumed run of a finished image reports `tried: 0 B` and completes in about a second. A hard crash can cost at most the last mapfile flush (roughly 30 seconds of progress). Note that the log line `Starting positions: infile = 0 B, outfile = 0 B` appears even on a perfect resume, so it does **not** mean a restart — check `tried:` instead.
+No, and it doesn't take twice as long. Already-rescued ranges are skipped without being read or rewritten, a resumed run of a finished image reports `tried: 0 B` and completes in about a second. A hard crash can cost at most the last mapfile flush (roughly 30 seconds of progress). Note that the log line `Starting positions: infile = 0 B, outfile = 0 B` appears even on a perfect resume, so it does **not** mean a restart, check `tried:` instead.
 
 ### Why does a folder show "partial" when the copy already finished?
 
@@ -622,31 +726,71 @@ Because a percentage measured against the *raw* source size can never reach 100%
 
 ### Do I need the .vswp file to restore a VM?
 
-No. A `.vswp` file is the VM's memory swap, created fresh by the host at power-on and meaningless once the VM is off. It's also frequently the largest file in the folder — often tens of gigabytes — so copying it wastes hours and space. The same goes for `*-ctk.vmdk` change-tracking files and `vmware-*.log`. All are excluded by default.
+No. A `.vswp` file is the VM's memory swap, created fresh by the host at power-on and meaningless once the VM is off. It's also frequently the largest file in the folder, often tens of gigabytes, so copying it wastes hours and space. The same goes for `*-ctk.vmdk` change-tracking files and `vmware-*.log`. All are excluded by default.
 
 ### What does `bad areas: 0` mean in ddrescue output?
 
-It means **every sector was read successfully — a clean, complete recovery.** It's the single number worth checking before you trust a recovered disk image; the equivalent field in the mapfile is `errsize: 0`. A matching file size is reassuring but weaker: a size match only proves the right number of bytes exist, while `bad areas: 0` proves they were all actually read from the source.
+It means **every sector was read successfully, a clean, complete recovery.** It's the single number worth checking before you trust a recovered disk image; the equivalent field in the mapfile is `errsize: 0`. A matching file size is reassuring but weaker: a size match only proves the right number of bytes exist, while `bad areas: 0` proves they were all actually read from the source.
 
-### ESXi asks "I copied it" or "I moved it" on first boot — which do I pick?
+### ESXi asks "I copied it" or "I moved it" on first boot, which do I pick?
 
-Pick **"I copied it"**. That issues a fresh UUID and MAC address, which avoids colliding with the original VM if it ever comes back online. Choose "I moved it" only when this host is a guaranteed 1:1 replacement and the original will never run again — it preserves the identity, including the MAC, which is what you want if something is licensed to it.
+Pick **"I copied it"**. That issues a fresh UUID and MAC address, which avoids colliding with the original VM if it ever comes back online. Choose "I moved it" only when this host is a guaranteed 1:1 replacement and the original will never run again, it preserves the identity, including the MAC, which is what you want if something is licensed to it.
 
 ### Is it safe to mount a VMFS volume with vmfs6-fuse?
 
-Mounting is safe, and this workflow only ever reads. Treat the source as strictly read-only for the duration of a recovery: never write to `/mnt/vmfs`, never repartition or "repair" the source disk, and get a verified copy off it first. If the drive is degrading, every extra read costs you something — which is why resume support matters, and why running one copy at a time is deliberate.
+Mounting is safe, and this workflow only ever reads. Treat the source as strictly read-only for the duration of a recovery: never write to `/mnt/vmfs`, never repartition or "repair" the source disk, and get a verified copy off it first. If the drive is degrading, every extra read costs you something, which is why resume support matters, and why running one copy at a time is deliberate.
 
 ### Does this work on VMFS5 instead of VMFS6?
 
-Yes, with a different FUSE driver. Use `vmfs-fuse` from **`vmfs-tools`** for VMFS3/VMFS5 volumes, and `vmfs6-fuse` from **`vmfs6-tools`** for VMFS6. Everything downstream — the `ddrescue` and `rsync` strategy, `vmfs-copy.sh`, the ESXi 8 restore — is identical, since it all operates on ordinary files once the volume is mounted.
+Yes, with a different FUSE driver. Use `vmfs-fuse` from **`vmfs-tools`** for VMFS3/VMFS5 volumes, and `vmfs6-fuse` from **`vmfs6-tools`** for VMFS6. Everything downstream, the `ddrescue` and `rsync` strategy, `vmfs-copy.sh`, the ESXi 8 restore, is identical, since it all operates on ordinary files once the volume is mounted.
 
 ### Why does WSL2 hang during a large USB copy?
 
-Because several I/O-heavy jobs running at once through WSL2's virtualized USB stack is fragile enough to hang the WSL VM itself, and a bus-powered enclosure can brown out under the combined current draw of multiple read streams. Run **one copy at a time** against a given physical drive — `vmfs-copy.sh` processes folders sequentially by design — and power the enclosure from its own adapter or a powered hub.
+Because several I/O-heavy jobs running at once through WSL2's virtualized USB stack is fragile enough to hang the WSL VM itself, and a bus-powered enclosure can brown out under the combined current draw of multiple read streams. Run **one copy at a time** against a given physical drive, `vmfs-copy.sh` processes folders sequentially by design, and power the enclosure from its own adapter or a powered hub.
+
+### Do I have to take the disk offline in Windows before attaching it to WSL?
+
+Yes. While Windows holds the disk online it keeps the device claimed, and `usbipd bind` or `usbipd attach` will report the device as in use. Offline it first with `diskpart` (`select disk N`, `offline disk`) or let [`vmfs-attach.ps1`](vmfs-attach.ps1) do it. Offline is also the safer state: while the VMFS disk is online, Windows repeatedly offers to format it, because it cannot read the filesystem.
+
+### Does the copier script handle the diskpart and usbipd steps?
+
+No, and it cannot. `vmfs-copy.sh` runs inside WSL, and `diskpart` and `usbipd` are Windows executables that need an elevated Windows shell, so from inside WSL there is no way to offline a Windows disk or bind a USB device to itself. That is what [`vmfs-attach.ps1`](vmfs-attach.ps1) is for. If the datastore is not mounted, the copier now refuses to start and prints all three prerequisite steps, because a missed step and an empty datastore look identical from inside WSL.
+
+### I deleted the recovered files but kept the ddrescue mapfile. Will a re-run notice?
+
+Yes. A mapfile is a claim about the content of one specific output file, so if that file was deleted or truncated the claim is void: acting on it would make `ddrescue` skip every range marked rescued without reading it, then report a finished copy over a missing or half-written disk image, in about a second. `vmfs-copy.sh` compares the highest offset the mapfile vouches for against the actual size of the destination file, and ignores the mapfile if the file is smaller or gone:
+
+```text
+  [! ] Stale mapfile ignored: /home/you/VM-map.log
+      claims 90.0G already written here, but the file holds 0B.
+```
+
+The copy then starts from zero, which is correct, because there is nothing on the destination to resume onto.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
 ## 🎛 Script Reference (flags & internals)
+
+### `vmfs-attach.ps1` (Windows, elevated)
+
+```text
+.\vmfs-attach.ps1 [options]
+```
+
+| Flag | Default | Does |
+|---|---|---|
+| `-Mount` | off | Also mount the datastore with `vmfs6-fuse` after attaching |
+| `-Detach` | off | Reverse everything: unmount, `usbipd detach`, bring the disk online |
+| `-BusId <id>` | auto-detect | Skip enclosure detection, e.g. `3-2` |
+| `-DiskNumber <n>` | auto-detect | Skip disk detection, e.g. `2` |
+| `-Src <path>` | `/mnt/vmfs` | Mount point to create inside WSL |
+| `-Dest <path>` | `/mnt/d` | Destination drive, used only in the closing hint |
+| `-Distro <name>` | default distro | Which WSL distro to work in |
+| `-Yes` | off | Accept the detected defaults, no prompts |
+| `-DryRun` | off | Print every action, change nothing |
+| `-TimeoutSec <n>` | `90` | How long to wait for attach and for the block device to appear |
+
+### `vmfs-copy.sh` (WSL)
 
 ```text
 ./vmfs-copy.sh [options]
@@ -663,17 +807,17 @@ Because several I/O-heavy jobs running at once through WSL2's virtualized USB st
 | `--no-ddrescue` | off | `rsync` everything (faster, **no** bad-sector retry) |
 | `--keep-logs` | off | Also copy `vmware-*.log` files |
 | `--dry-run`, `-n` | off | Print the plan + space check, copy nothing |
-| `--no-sudo` | off | Already root / source is readable — call tools directly |
-| `--help`, `-h` | — | Usage |
+| `--no-sudo` | off | Already root / source is readable, call tools directly |
+| `--help`, `-h` | (none) | Usage |
 
 **Design choices baked in:**
 
-- 🔁 **Resumable by default** — mapfiles persist in `--mapdir`; re-running never restarts a disk image from zero.
-- 🧮 **Space check before it starts** — refuses (or warns) if the selection won't fit on the destination.
-- 🎚 **Sequential, never parallel** — one folder at a time, because concurrent USB I/O is what browns out enclosures and hangs WSL.
-- 🧾 **Verifies every folder** — compares apparent size of source vs destination and flags any real shortfall (excluded `.vswp`/`.log` are accounted for).
-- 🖱 **Flexible selection** — `1 3`, ranges `1-3`, `all`, or `q` to bail; de-duplicates overlapping picks.
-- 🎨 **Degrades gracefully** — no `ddrescue`? Falls back to `rsync`. No TTY? Drops the colors. Not root and no `sudo`? Warns instead of dying.
+- 🔁 **Resumable by default**, mapfiles persist in `--mapdir`; re-running never restarts a disk image from zero.
+- 🧮 **Space check before it starts**, refuses (or warns) if the selection won't fit on the destination.
+- 🎚 **Sequential, never parallel**, one folder at a time, because concurrent USB I/O is what browns out enclosures and hangs WSL.
+- 🧾 **Verifies every folder**, compares apparent size of source vs destination and flags any real shortfall (excluded `.vswp`/`.log` are accounted for).
+- 🖱 **Flexible selection**, `1 3`, ranges `1-3`, `all`, or `q` to bail; de-duplicates overlapping picks.
+- 🎨 **Degrades gracefully**, no `ddrescue`? Falls back to `rsync`. No TTY? Drops the colors. Not root and no `sudo`? Warns instead of dying.
 
 > [!NOTE]
 > **Common flag combos.** `--all --yes` = unattended full pull. `--dry-run` = see the plan, touch nothing. `--big-mb 512` = treat 512 MB+ images as `ddrescue` candidates. `--no-ddrescue` = healthy drive, want speed over bad-sector resilience.
@@ -682,16 +826,16 @@ Because several I/O-heavy jobs running at once through WSL2's virtualized USB st
 
 ## 🗒 Field Notes
 
-- These are **personal field notes from a real recovery session**, not official VMware/Broadcom documentation — cross-check anything safety-critical against current vendor docs, especially exact CLI flags, which shift between ESXi releases.
-- **Busid numbers, `/dev/sdX` letters, drive letters, and folder names will all differ next time.** Only the *shape* of the process stays the same — that's what the diagrams and the script are for.
-- **Known-good enclosure:** `0bda:9210` (Realtek UAS bridge). It's shown power sensitivity under concurrent multi-stream I/O — run one copy operation at a time against it. The script does this by default.
+- These are **personal field notes from a real recovery session**, not official VMware/Broadcom documentation, cross-check anything safety-critical against current vendor docs, especially exact CLI flags, which shift between ESXi releases.
+- **Busid numbers, `/dev/sdX` letters, drive letters, and folder names will all differ next time.** Only the *shape* of the process stays the same, that's what the diagrams and the script are for.
+- **Known-good enclosure:** `0bda:9210` (Realtek UAS bridge). It's shown power sensitivity under concurrent multi-stream I/O, run one copy operation at a time against it. The script does this by default.
 - **`bad areas: 0` is the number that matters.** A size match is a good sign; a clean `ddrescue` summary is the proof.
-- **Last verified: 24 August 2026** — Windows 11 Pro (build 26200), WSL2 Ubuntu, GNU `ddrescue` 1.27, against a 931 GB VMFS6 volume in a Realtek `0bda:9210` enclosure.
-- **Machine-readable summaries live alongside this README** — [`llms.txt`](llms.txt) for LLMs and answer engines, [`CITATION.cff`](CITATION.cff) if you need to cite this.
+- **Last verified: 24 August 2026**. Windows 11 Pro (build 26200), WSL2 Ubuntu, GNU `ddrescue` 1.27, against a 931 GB VMFS6 volume in a Realtek `0bda:9210` enclosure.
+- **Machine-readable summaries live alongside this README**, [`llms.txt`](llms.txt) for LLMs and answer engines, [`CITATION.cff`](CITATION.cff) if you need to cite this.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
-## 🙋 Author &amp; License
+## 🙋 Author & License
 
 <div align="center">
 
@@ -699,7 +843,7 @@ Because several I/O-heavy jobs running at once through WSL2's virtualized USB st
 
 <a href="https://github.com/aniksarakash"><img src="https://img.shields.io/badge/GitHub-@aniksarakash-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub profile: @aniksarakash" /></a>
 
-Released under the **MIT License** — use it, adapt it, recover your data with it.
+Released under the **MIT License**, use it, adapt it, recover your data with it.
 
 </div>
 
@@ -711,15 +855,15 @@ Released under the **MIT License** — use it, adapt it, recover your data with 
 
 The phrasings people actually use for this problem. If any of these is what you searched for, you're in the right place.
 
-**The filesystem** — VMFS · VMFS6 · VMFS5 · **VFMS** *(common transposition of VMFS)* · Virtual Machine File System · VMware datastore · `-flat.vmdk` · flat VMDK · VMDK descriptor file · `.vmx` · `.nvram`
+**The filesystem**. VMFS · VMFS6 · VMFS5 · **VFMS** *(common transposition of VMFS)* · Virtual Machine File System · VMware datastore · `-flat.vmdk` · flat VMDK · VMDK descriptor file · `.vmx` · `.nvram`
 
-**The situation** — recover a VMware VM from a bare VMFS drive · read a VMFS disk on Windows · VMFS drive shows no filesystem in Disk Management · Windows wants to format my VMFS disk · drive pulled from a dead ESXi host · recover VMs without an ESXi host · ESXi host failed but the disk is fine · decommissioned ESXi host data recovery · VMFS datastore in a USB enclosure · read a VMware datastore without vSphere · get VMs off a hypervisor that won't boot
+**The situation**, recover a VMware VM from a bare VMFS drive · read a VMFS disk on Windows · VMFS drive shows no filesystem in Disk Management · Windows wants to format my VMFS disk · drive pulled from a dead ESXi host · recover VMs without an ESXi host · ESXi host failed but the disk is fine · decommissioned ESXi host data recovery · VMFS datastore in a USB enclosure · read a VMware datastore without vSphere · get VMs off a hypervisor that won't boot
 
-**The tooling** — mount VMFS in WSL2 · `vmfs6-fuse` · `vmfs6-tools` · `vmfs-fuse` · `usbipd-win` · `usbipd attach --wsl` · WSL2 USB passthrough · `diskpart offline disk` · `drvfs` · `ddrescue` VMDK bad sectors · GNU ddrescue mapfile · resume an interrupted ddrescue · `rsync` exclude `.vswp` · Realtek `0bda:9210` UAS enclosure
+**The tooling**, mount VMFS in WSL2 · `vmfs6-fuse` · `vmfs6-tools` · `vmfs-fuse` · `usbipd-win` · `usbipd attach --wsl` · WSL2 USB passthrough · `diskpart offline disk` · `drvfs` · `ddrescue` VMDK bad sectors · GNU ddrescue mapfile · resume an interrupted ddrescue · `rsync` exclude `.vswp` · Realtek `0bda:9210` UAS enclosure
 
-**The restore** — register a recovered VM on ESXi 8 · `vim-cmd solo/registervm` · `vmkfstools -i` to regenerate a descriptor · "I copied it" vs "I moved it" · reattach the NIC portgroup after a restore · upgrade VM compatibility
+**The restore**, register a recovered VM on ESXi 8 · `vim-cmd solo/registervm` · `vmkfstools -i` to regenerate a descriptor · "I copied it" vs "I moved it" · reattach the NIC portgroup after a restore · upgrade VM compatibility
 
-**Adjacent problems this covers** — VMFS data recovery on Windows 11 · virtual machine disaster recovery runbook · bad-sector recovery for very large disk images · resumable multi-hundred-gigabyte copy over USB · post-incident ESXi recovery onto a quarantine portgroup
+**Adjacent problems this covers**. VMFS data recovery on Windows 11 · virtual machine disaster recovery runbook · bad-sector recovery for very large disk images · resumable multi-hundred-gigabyte copy over USB · post-incident ESXi recovery onto a quarantine portgroup
 
 <br/>
 

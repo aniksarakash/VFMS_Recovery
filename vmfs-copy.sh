@@ -122,13 +122,45 @@ trap 'printf "\n"; err "Interrupted. Progress is on disk - rerun to resume."; ex
 printf '\n%s\n' "${B}VMFS recovery copier${R}"
 hr
 
-[[ -d $SRC ]]  || die "Source '$SRC' does not exist. Mount it first: sudo vmfs6-fuse /dev/sdX1 $SRC"
+# The three prerequisites all live on the Windows side, outside WSL, so this
+# script cannot perform them - it can only refuse to run and say which one is
+# missing. Printed on every "no datastore" failure, because a forgotten diskpart
+# offline, a detached enclosure, and a datastore that was never mounted all look
+# identical from in here: an empty directory.
+attach_help() {
+  printf '\n  %s\n' "${B}The datastore must be attached and mounted before this script runs:${R}"
+  printf '  %s\n' \
+    "  ${CY}1.${R} Windows, ${B}admin${R} PowerShell - take the disk offline so Windows lets go of it:" \
+    "       diskpart" \
+    "       list disk   ${DIM}then${R}   select disk N   ${DIM}then${R}   offline disk   ${DIM}then${R}   exit" \
+    "" \
+    "  ${CY}2.${R} Windows, ${B}admin${R} PowerShell - hand the enclosure to WSL:" \
+    "       usbipd list                          ${DIM}# note the BUSID of the enclosure${R}" \
+    "       usbipd bind   --busid <BUSID>        ${DIM}# once per device, needs admin${R}" \
+    "       usbipd attach --wsl --busid <BUSID>  ${DIM}# must then read 'Attached'${R}" \
+    "" \
+    "  ${CY}3.${R} WSL - locate the disk and mount VMFS6:" \
+    "       lsblk                                ${DIM}# confirm full size; sdX drifts between attaches${R}" \
+    "       sudo mkdir -p $SRC" \
+    "       sudo vmfs6-fuse /dev/sdX1 $SRC" \
+    ""
+}
+
+if [[ ! -d $SRC ]]; then
+  err "Source '$SRC' does not exist."
+  attach_help; exit 1
+fi
 [[ -d $DEST ]] || die "Destination '$DEST' does not exist. Try: sudo mkdir -p $DEST && sudo mount -t drvfs ${DEST##*/}: $DEST"
 
 if mountpoint -q "$SRC" 2>/dev/null; then
   ok "Source mounted: ${B}$SRC${R}"
+elif [[ -z $(ls -A "$SRC" 2>/dev/null) ]]; then
+  # An empty $SRC is the common shape of every missed step above: the directory
+  # survives an unmount, so "it exists" proves nothing about the datastore.
+  err "Source '$SRC' exists but is empty - the datastore is not mounted."
+  attach_help; exit 1
 else
-  warn "Source '$SRC' is a plain directory, not a mountpoint - continuing anyway."
+  warn "Source '$SRC' is not a mountpoint but has content - continuing anyway."
 fi
 
 # Resolve how we escalate: already-root and --no-sudo both mean "call things directly".
@@ -304,9 +336,45 @@ ddr_field() {   # $1 logfile  $2 field label -> last occurrence with its value
 # adopt it. Matching both paths is what makes reuse safe: a mapfile asserts which
 # regions of one specific output file are already good, so applying one from a
 # different destination would mark never-written regions as rescued.
+
+# Highest byte offset a mapfile claims is good: max(pos+size) over "+" blocks.
+# Bash arithmetic reads the 0x fields directly. The "current_pos" header line has
+# "+" in the second field rather than a 0x size, so requiring both to be hex
+# skips it.
+map_rescued_end() {   # $1 mapfile -> decimal high-water mark of rescued data
+  local pos size st end max=0
+  while read -r pos size st _; do
+    [[ $pos == 0x* && $size == 0x* && $st == '+' ]] || continue
+    end=$(( pos + size ))
+    (( end > max )) && max=$end
+  done < <($SUDO grep -a '^0x' -- "$1" 2>/dev/null)
+  printf '%s\n' "$max"
+}
+
+# Matching path strings is not enough. A mapfile is a claim about the CONTENT of
+# one specific output file, so if that file was deleted or truncated between runs
+# the claim is void - and acting on it is worse than ignoring it, because ddrescue
+# would skip every "rescued" range without reading it and report a finished copy
+# over a missing or half-written disk image. Trust the mapfile only if the output
+# is still at least as large as the region it vouches for.
+map_valid_for() {   # $1 mapfile  $2 output file
+  local need cur
+  need=$(map_rescued_end "$1")
+  (( need > 0 )) || return 0                  # nothing claimed yet: harmless
+  cur=$($SUDO stat -c %s -- "$2" 2>/dev/null || printf 0)
+  (( cur >= need )) && return 0
+  warn "Stale mapfile ignored: ${DIM}$1${R}"
+  info "    claims $(human "$need") already written here, but the file holds $(human "${cur:-0}")."
+  return 1
+}
+
 adopt_mapfile() {   # $1 wanted mapfile  $2 source file  $3 output file
   local want=$1 sf=$2 df=$3 cand
-  [[ -s $want ]] && return 0
+  if [[ -s $want ]]; then
+    map_valid_for "$want" "$df" && return 0
+    # Leaving it in place would make ddrescue skip data that is not there.
+    $SUDO mv -f "$want" "$want.stale" 2>/dev/null || $SUDO rm -f "$want" 2>/dev/null
+  fi
   for cand in "$MAPDIR"/*.map "$MAPDIR"/*.mapfile "$MAPDIR"/*map.log \
               "${HOME:-/root}"/*.map "${HOME:-/root}"/*.mapfile "${HOME:-/root}"/*map.log \
               /root/*.map /root/*.mapfile /root/*map.log \
@@ -315,6 +383,7 @@ adopt_mapfile() {   # $1 wanted mapfile  $2 source file  $3 output file
     [[ $cand == "$want" ]] && continue
     $SUDO grep -aqF -- "$df" "$cand" 2>/dev/null || continue
     $SUDO grep -aqF -- "$sf" "$cand" 2>/dev/null || continue
+    map_valid_for "$cand" "$df" || continue
     if $SUDO cp -f "$cand" "$want" 2>/dev/null; then
       ok "Resuming from an earlier mapfile: ${DIM}$cand${R}"
       return 0
@@ -322,7 +391,6 @@ adopt_mapfile() {   # $1 wanted mapfile  $2 source file  $3 output file
   done
   return 0
 }
-
 copy_big() {    # $1 srcfile  $2 dstfile  $3 mapfile  $4 total bytes  $5 label
   local sf=$1 df=$2 mf=$3 total=$4 label=$5
   local log="$MAPDIR/$(basename "$df").ddrescue.log"

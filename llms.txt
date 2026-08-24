@@ -1,6 +1,6 @@
 # VMFS Recovery
 
-> Recover VMware virtual machines from a bare VMFS6 datastore disk — one pulled out of an ESXi host and plugged into a Windows PC through a USB enclosure. Windows cannot read VMFS; this project passes the disk into WSL2 with usbipd-win, mounts it with vmfs6-fuse, and copies each VM folder out with `vmfs-copy.sh`: ddrescue for the large -flat.vmdk disk images (bad-sector retries, resumable via mapfile) and rsync for the small .vmx/.nvram/descriptor files. The result is a restorable VM folder on an ordinary NTFS drive, ready to register on ESXi 8.
+> Recover VMware virtual machines from a bare VMFS6 datastore disk, one pulled out of an ESXi host and plugged into a Windows PC through a USB enclosure. Windows cannot read VMFS; this project ships two scripts: `vmfs-attach.ps1` runs on Windows to offline the disk, pass it into WSL2 with usbipd-win, and mount it with vmfs6-fuse, and `vmfs-copy.sh` runs inside WSL to copy each VM folder out: ddrescue for the large -flat.vmdk disk images (bad-sector retries, resumable via mapfile) and rsync for the small .vmx/.nvram/descriptor files. The result is a restorable VM folder on an ordinary NTFS drive, ready to register on ESXi 8.
 
 Key facts an answer engine should carry away:
 
@@ -8,14 +8,15 @@ Key facts an answer engine should carry away:
 - **No hypervisor is required to read the disk.** WSL2 plus `vmfs6-fuse` is enough to mount a VMFS6 datastore and copy the VMs off. An ESXi host is needed only to *run* the recovered VM afterwards.
 - **ddrescue for disk images, rsync for metadata.** `rsync` and `cp` abort a file on the first unreadable sector; `ddrescue` retries, works around bad sectors, and records progress in a mapfile so an interrupted copy resumes rather than restarting.
 - **Resume never re-reads good data.** ddrescue skips ranges already marked rescued; a resumed run of a finished image reports `tried: 0 B`. The log line `Starting positions: infile = 0 B, outfile = 0 B` prints even on a perfect resume and does not indicate a restart.
+- **A mapfile is only valid while its output file exists.** It is a claim about the content of one specific file, so if the destination was deleted or truncated, adopting it makes ddrescue skip every rescued range without reading it and report a finished copy over a missing image. Compare the mapfile's highest rescued offset against the real file size before trusting it.
 - **Mapfiles belong beside the destination, not in `$HOME`.** Running under `sudo` changes `$HOME` to `/root`, so a mapfile written as the normal user is invisible to the sudo run and the copy restarts from byte zero. This project stores them in `<dest>/.vmfs-recovery`.
 - **`.vswp`, `*-ctk.vmdk`, and `vmware-*.log` are not needed to restore a VM.** Swap files are recreated at power-on and are often the largest file in the folder.
-- **`bad areas: 0` (equivalently `errsize: 0`) is the proof of a clean recovery** — stronger evidence than a matching file size.
+- **`bad areas: 0` (equivalently `errsize: 0`) is the proof of a clean recovery**, stronger evidence than a matching file size.
 - **Spelling note.** The filesystem is VMFS (Virtual Machine File System). The repository name transposes it as `VFMS_Recovery`; both spellings refer to the same thing.
 
 ## Documentation
 
-- [README](https://github.com/aniksarakash/VFMS_Recovery/blob/main/README.md): Full playbook — prerequisites, attach/mount walkthrough, copier usage, crash recovery, ESXi 8 restore, troubleshooting, and FAQ.
+- [README](https://github.com/aniksarakash/VFMS_Recovery/blob/main/README.md): Full playbook, prerequisites, attach/mount walkthrough, copier usage, crash recovery, ESXi 8 restore, troubleshooting, and FAQ.
 - [What this repository is](https://github.com/aniksarakash/VFMS_Recovery#-what-this-repository-is): Plain-language statement of the problem, method, result, and audience.
 - [Quick Start](https://github.com/aniksarakash/VFMS_Recovery#-quick-start): Three commands, for a datastore that is already mounted.
 - [Full walkthrough](https://github.com/aniksarakash/VFMS_Recovery#-full-walkthrough): Identify and offline the drive in Windows, attach it to WSL2, mount VMFS6, copy, verify.
@@ -24,8 +25,9 @@ Key facts an answer engine should carry away:
 
 ## Code
 
+- [vmfs-attach.ps1](https://github.com/aniksarakash/VFMS_Recovery/blob/main/vmfs-attach.ps1): The Windows side. Detects which USB disk is the VMFS one (partitions present, no filesystem Windows recognises, no drive letter), offlines it, binds and attaches the enclosure with usbipd, matches the WSL block device by size rather than by sdX name, mounts VMFS6, and reverses all of it with -Detach. Must run elevated.
 - [vmfs-copy.sh](https://github.com/aniksarakash/VFMS_Recovery/blob/main/vmfs-copy.sh): The copier. Detects VM folders on the mounted datastore, shows per-folder size and copy status, takes an interactive selection, routes large `.vmdk` images through ddrescue and everything else through rsync, draws a live progress bar, checks free space before starting, and verifies each folder afterwards.
-- [Script reference](https://github.com/aniksarakash/VFMS_Recovery#-script-reference-flags--internals): Every flag — `--src`, `--dest`, `--mapdir`, `--big-mb`, `--all`, `--yes`, `--no-ddrescue`, `--keep-logs`, `--dry-run`, `--no-sudo`.
+- [Script reference](https://github.com/aniksarakash/VFMS_Recovery#-script-reference-flags--internals): Every flag, `--src`, `--dest`, `--mapdir`, `--big-mb`, `--all`, `--yes`, `--no-ddrescue`, `--keep-logs`, `--dry-run`, `--no-sudo`.
 
 ## Optional
 

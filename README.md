@@ -655,6 +655,32 @@ sudo ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
 </details>
 
 <details>
+<summary><strong>🔧 <code>-Mount</code> reports the datastore mounted and lists the VMs, but the copier says it "exists but is empty"</strong></summary>
+
+<br/>**Cause:** the two are looking at different **mount namespaces**. A mount belongs to a namespace, not to the machine, and WSL does not put every session in the same one: the `wsl.exe` calls `vmfs-attach.ps1` makes from an elevated PowerShell can land in one namespace while the WSL window you type the copier into sits in another. Both views are honest. `vmfs6-fuse` really is running, `/mnt/vmfs` really does list seven VM folders in the script's session, and in your window `/mnt/vmfs` really is an empty directory. Nothing is stale, so every check phrased as "is it mounted?" answers yes.
+
+Confirm it in one line, comparing the mount namespace of your shell against the one holding the server:
+
+```bash
+readlink /proc/self/ns/mnt          # your window
+sudo ps -eo pid,args | grep '[v]mfs6-fuse'
+sudo readlink /proc/<that-pid>/ns/mnt   # different id = different view
+```
+
+A `vmfs6-fuse` alive with `/mnt/vmfs` in its own `/proc/<pid>/mountinfo` and absent from yours is the whole diagnosis.
+
+**Fix:** mount it in the window you are going to copy from, which puts the mount in that window's namespace by construction:
+
+```bash
+sudo mkdir -p /mnt/vmfs
+sudo vmfs6-fuse /dev/sdX8 /mnt/vmfs
+sudo ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
+```
+
+A current `vmfs-attach.ps1 -Mount` checks for this before it claims success: it enumerates the mount namespaces that hold a shell, names any that cannot see the mount, and offers to mount into them with `nsenter -t <pid> -m`. A second read-only `vmfs6-fuse` against the same partition is safe. Note that `wsl --shutdown` also clears it, by ending every namespace at once, but it drops the `usbipd` attach with them and you start from step 1.
+</details>
+
+<details>
 <summary><strong>🔧 <code>vmfs-attach.ps1</code> asks which disk to offline, and the VMFS disk isn't listed</strong></summary>
 
 <br/>**Cause:** the enclosure is *already* attached to WSL. `usbipd attach` removes the device from Windows, so `Get-Disk` cannot see that disk at all, and the list you're looking at is the other drives on the bench, one of which is your copy destination.

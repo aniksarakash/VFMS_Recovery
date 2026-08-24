@@ -132,6 +132,99 @@ function Wsl ([string] $Cmd) {
   return (& wsl.exe @a 2>&1)
 }
 
+# Whether $Path is usable, not merely listed. A FUSE mount has a third state that
+# two-way thinking misses: still in the kernel mount table, with no server left to
+# answer for it. "mountpoint -q" cannot see that state, because it stats the path,
+# and a stat against a dead FUSE server fails the same way a missing directory
+# does. The tell inside WSL is a row of question marks for the mount in
+# "ls -la /mnt".
+#   LIVE  - mounted, and something answers for it
+#   STALE - in the mount table, but nothing answers
+#   FREE  - nothing mounted there
+function Get-MountState ([string] $Path) {
+  # NOTAB rather than NOTINTAB: a token that contains the positive token as a
+  # substring makes every -match test below read true.
+  $r = @(Wsl "grep -q -- ' $Path ' /proc/self/mountinfo && echo INTAB || echo NOTAB; ls -1 -- '$Path' >/dev/null 2>&1 && echo SERVING || echo DEAD")
+  $t = ($r -join ' ')
+  if ($t -match 'INTAB') {
+    if ($t -match 'SERVING') { return 'LIVE' }
+    return 'STALE'
+  }
+  return 'FREE'
+}
+
+# Kill the server before unmounting. fusermount -u resolves the mountpoint first,
+# which is the one thing a dead FUSE mount cannot do, so it fails exactly when it
+# is needed; umount -l detaches the subtree without asking the process at all.
+# The pkill pattern is bracketed so it cannot match the bash -lc that carries it,
+# which would otherwise kill the shell running the command.
+function Clear-StaleMount ([string] $Path) {
+  Wsl "pkill -f '[v]mfs6-fuse .*$Path' 2>/dev/null; pkill -f '[v]mfs-fuse .*$Path' 2>/dev/null; exit 0" | Out-Null
+  Wsl "fusermount -u -- '$Path' 2>/dev/null || umount -l -- '$Path' 2>/dev/null || umount -f -- '$Path' 2>/dev/null; exit 0" | Out-Null
+  Start-Sleep -Milliseconds 300
+  Wsl "mkdir -p -- '$Path' 2>/dev/null; exit 0" | Out-Null
+}
+
+# A mount is not a property of the machine. It is a property of a mount namespace,
+# and WSL hands out more than one of them: the sessions this script drives through
+# wsl.exe do not always land in the same namespace as the WSL window the operator
+# already has open. When they differ, everything here reports a perfect mount, the
+# datastore listing prints, and the copier run in that other window still says
+#   Source '/mnt/vmfs' exists but is empty - the datastore is not mounted.
+# because in that namespace it genuinely is empty. The tell is a vmfs6-fuse process
+# that is alive with $Src in its own /proc/<pid>/mountinfo and absent from someone
+# else's. Nothing is broken and nothing is stale, so every check written in terms
+# of "is it mounted" answers yes and the operator is left with a contradiction.
+#
+# So look from the other side: enumerate the mount namespaces that hold a shell,
+# and ask each one whether it can see $Src. Only namespaces with a shell in them
+# count, because those are the windows someone is going to type the copier into.
+# One representative pid per namespace is enough, and it doubles as the nsenter
+# target for the repair below.
+function Get-ShellSessions ([string] $Path) {
+  $sh = @'
+mine=$(readlink /proc/self/ns/mnt)
+for d in /proc/[0-9]*; do
+  c=$(tr '\000' ' ' < "$d/cmdline" 2>/dev/null)
+  case "$c" in *bash*|*zsh*|*fish*|*dash*) : ;; *) continue ;; esac
+  n=$(readlink "$d/ns/mnt" 2>/dev/null)
+  [ -n "$n" ] || continue
+  [ "$n" = "$mine" ] && continue
+  if grep -q " __PATH__ " "$d/mountinfo" 2>/dev/null; then s=SEES; else s=BLIND; fi
+  echo "$n|$s|${d#/proc/}|$(echo "$c" | cut -c1-48)"
+done | awk -F'|' '!seen[$1]++'
+'@
+  $sh = $sh -replace '__PATH__', $Path
+  $out = @()
+  foreach ($l in @(Wsl $sh)) {
+    $t = "$l".Trim()
+    if ($t -notmatch '^mnt:\[') { continue }
+    $f = $t -split '\|', 4
+    if ($f.Count -lt 4) { continue }
+    $out += [pscustomobject]@{ Ns = $f[0]; State = $f[1]; Pid = $f[2]; Cmd = $f[3] }
+  }
+  return $out
+}
+
+# Mount into someone else's namespace rather than telling them to close the window
+# and start again. nsenter -m joins that namespace, so the vmfs6-fuse started there
+# is visible to the shell that is already sitting in it. A second read-only server
+# against the same partition is safe: vmfs6-fuse never writes, and the copier only
+# ever reads.
+function Add-MountToSession ([string] $TargetPid, [string] $Dev, [string] $Path) {
+  Wsl "nsenter -t $TargetPid -m -- mkdir -p -- '$Path' 2>&1; exit 0" | Out-Null
+  $out = Wsl "nsenter -t $TargetPid -m -- vmfs6-fuse '$Dev' '$Path' 2>&1; exit 0"
+  # vmfs6-fuse daemonises, so nsenter returns before the mount is in the table.
+  # Asking once read a good mount as a failure often enough to be worth the poll.
+  $seen = $false
+  for ($i = 0; $i -lt 12; $i++) {
+    $chk = "$(Wsl "grep -q -- ' $Path ' /proc/$TargetPid/mountinfo && echo SEES || echo BLIND")"
+    if ($chk -match 'SEES') { $seen = $true; break }
+    Start-Sleep -Milliseconds 500
+  }
+  return @{ Ok = $seen; Out = $out }
+}
+
 # usbipd's own state is the only source of truth for BUSID. Prefer "usbipd state",
 # which is JSON, over "usbipd list", whose table truncates long device names to an
 # ellipsis and whose STATE wording has changed across versions ("Attached - WSL" on
@@ -504,6 +597,28 @@ if ($AlreadyAttached) {
   $DiskSize = $disk.Size
   Inf "Selected: ${BD}disk $DiskNumber$RS  $($disk.FriendlyName)  $DIM$(Human $DiskSize)$RS"
 
+  # A USB to NVMe bridge has to fit the drive model string into the SCSI INQUIRY
+  # vendor and product fields, which are 8 and 16 bytes. Realtek bridges fill the
+  # vendor field to all 8 bytes and spill the rest into product. Windows shows
+  # vendor, a space, then product, so a drive reporting "Force MP600" appears as
+  # "Force MP 600" and reads like some other product entirely. Say so here: a name
+  # that looks wrong on a disk picker is exactly when someone aborts a recovery,
+  # and the serial below is the identifier no bridge can garble.
+  $ven = ''; $prod = ''
+  $wmi = Get-CimInstance Win32_DiskDrive -Filter "Index=$DiskNumber" -ErrorAction SilentlyContinue
+  if ($wmi -and "$($wmi.PNPDeviceID)" -match 'VEN_([^&]*)&PROD_([A-Za-z0-9_. -]*)') {
+    $ven  = ($Matches[1] -replace '_', ' ')
+    $prod = ($Matches[2] -replace '_', ' ')
+  }
+  $fn = "$($disk.FriendlyName)"
+  if ($ven.Length -eq 8 -and $fn.Length -gt 9 -and $fn.Substring(8, 1) -eq ' ') {
+    Note "The SCSI vendor field is full at all 8 bytes: '$ven' plus '$prod'."
+    Inf "  ${DIM}A USB to NVMe bridge splits a longer model string across the two fields and"
+    Inf "  ${DIM}Windows rejoins them with a space, so this is most likely one product,$RS"
+    Inf "  ${BD}$($fn.Remove(8, 1))$RS${DIM}, rather than the wrong disk. Confirm by size and serial, not by name.$RS"
+  }
+  if ($disk.SerialNumber) { Inf "  ${DIM}Serial: $("$($disk.SerialNumber)".Trim())$RS" }
+
   if ($disk.IsOffline) {
     Ok "Disk $DiskNumber is already offline."
   } else {
@@ -675,6 +790,13 @@ if ($DryRun) {
   Write-Host ''; exit 1
 }
 Ok "Disk is ${BD}/dev/$SdName$RS inside WSL."
+# Windows had to read this drive through the bridge SCSI fields. Linux rejoins the
+# two halves, so this line is the model string the drive actually reports, and it
+# is the one to trust if the Windows side above looked wrong.
+if (-not $DryRun) {
+  $id = "$(Wsl "lsblk -dn -o MODEL,SERIAL,REV /dev/$SdName 2>/dev/null | head -1")".Trim()
+  if ($id) { Inf "  ${DIM}Drive reports: $id$RS" }
+}
 if (-not $DryRun -and $script:SdAll.Count -gt 1) {
   $how = "are $(Human $DiskSize)"
   if ($DiskSize -le 0) { $how = 'carry a VMFS partition' }
@@ -715,6 +837,11 @@ if (-not $Mount) {
   Inf "     $DIM sudo vmfs6-fuse /dev/$PartName $Src$RS"
   Inf "     $DIM sudo ./vmfs-copy.sh --src $Src --dest $Dest$RS"
   Write-Host ''
+  # Not the lesser path. Mounting in the same window the copier runs in puts the
+  # mount in that window's namespace by construction, which is the one thing
+  # -Mount cannot guarantee from the Windows side.
+  Inf "  ${DIM}Mounting in the window you will copy from is the safe order: the mount$RS"
+  Inf "  ${DIM}lands in that window's namespace, so the copier is certain to see it.$RS"
   Inf "  ${DIM}Or rerun this with -Mount to do the mount from here.$RS"
   Write-Host ''
   exit 0
@@ -745,31 +872,87 @@ if ("$have" -match 'NO') {
   Ok 'vmfs6-fuse present.'
 }
 
-$already = Wsl "mountpoint -q '$Src' && echo MOUNTED || echo NO"
-if ("$already" -match 'MOUNTED') {
-  Ok "$Src is already mounted."
-} elseif ($DryRun) {
-  Note "would mount /dev/$PartName at $Src"
-} else {
-  Wsl "mkdir -p '$Src'" | Out-Null
-  $out = Wsl "vmfs6-fuse '/dev/$PartName' '$Src' 2>&1"
-  # vmfs6-fuse daemonises, so the mount can still be settling when it returns.
-  # Asking mountpoint exactly once reported a perfectly good mount as a failure.
-  $chk = Wait-For -Label "mount appears at $Src" -Seconds 15 -Test {
-    return ("$(Wsl "mountpoint -q '$Src' && echo MOUNTED || echo NO")" -match 'MOUNTED')
+# Three states, not two. The old check asked "mountpoint -q", which stats the path,
+# so a mount whose vmfs6-fuse server has died answered "not a mountpoint" while the
+# kernel still had it mounted. The script read that as free, mounted over it, and
+# vmfs6-fuse refused with
+#   Error stat()ing '/mnt/vmfs'
+# because it cannot stat the mountpoint either, then the 15 second wait timed out
+# on the same bad question. A rerun after the enclosure is re-attached is exactly
+# how that state arises: the previous server still owns $Src, but the /dev/sdX it
+# was opened against is gone, because the disk came back under a different letter.
+$state = Get-MountState $Src
+
+if ($state -eq 'STALE') {
+  Note "$Src is mounted but nothing answers for it. An earlier attach left it behind."
+  if ($DryRun) {
+    Note "would clear the stale mount at $Src"
+    $state = 'FREE'
+  } else {
+    Clear-StaleMount $Src
+    $state = Get-MountState $Src
+    if ($state -eq 'STALE') {
+      Bad "Could not clear the stale mount at $Src."
+      Inf "  See what holds it: $DIM wsl -u root -- ps -ef | grep vmfs$RS"
+      Inf "  Force it off:      $DIM wsl -u root -- umount -l $Src$RS"
+      Inf "  ${DIM}wsl --shutdown clears it too, but it stops every distro and drops this attach.$RS"
+      Write-Host ''; exit 1
+    }
+    Ok "Cleared the stale mount at $Src."
   }
-  if (-not $chk) {
-    Bad 'Mount failed.'
-    foreach ($l in @($out)) { Inf "    $DIM$l$RS" }
-    Inf ''
-    Inf "  ${BD}Lun ID mismatch$RS warnings are normal. The disk moved to a different controller."
-    Inf "  ${BD}Permission denied$RS means you are not root inside WSL."
-    Inf "  ${BD}Cannot open volume$RS usually means the wrong partition. Check the others:"
-    Inf "     $DIM wsl -u root -- lsblk /dev/$SdName$RS"
-    Inf "  ${DIM}The mount is root owned, so run the copier with sudo rather than as yourself.$RS"
-    Write-Host ''; exit 1
+}
+
+if ($state -eq 'LIVE') {
+  # A live mount is not automatically the right mount. A rerun can find one left by
+  # a previous attach of a different disk, and silently reusing it would point the
+  # copier at the wrong datastore while every step above still reported success.
+  $srv = "$(Wsl "ps -eo args= 2>/dev/null | grep -F -- ' $Src' | grep -m1 -- '[v]mfs6-fuse' || exit 0")".Trim()
+  $srvDev = ''
+  if ($srv -match '(/dev/[A-Za-z0-9]+)') { $srvDev = $Matches[1] }
+  if (-not $DryRun -and $srvDev -and $srvDev -ne "/dev/$PartName") {
+    Note "$Src is already mounted, but from $srvDev, not /dev/$PartName."
+    $ansR = Ask "Remount from /dev/$PartName? [Y/n]" 'y'
+    if ($ansR -match '^[nN]') {
+      Note "Left the existing mount in place. It is not the disk you just attached."
+    } else {
+      Clear-StaleMount $Src
+      $state = Get-MountState $Src
+      if ($state -ne 'FREE') { Die "Could not unmount $Src to remount it from /dev/$PartName." }
+    }
+  } elseif ($srvDev) {
+    Ok "$Src is already mounted from $srvDev."
+  } else {
+    Ok "$Src is already mounted."
   }
-  Ok "Mounted /dev/$PartName at ${BD}$Src$RS."
+}
+
+if ($state -eq 'FREE') {
+  if ($DryRun) {
+    Note "would mount /dev/$PartName at $Src"
+  } else {
+    Wsl "mkdir -p '$Src'" | Out-Null
+    $out = Wsl "vmfs6-fuse '/dev/$PartName' '$Src' 2>&1"
+    # vmfs6-fuse daemonises, so the mount can still be settling when it returns.
+    # Asking exactly once reported a perfectly good mount as a failure. Test by
+    # reading the mount rather than by stat'ing it, so a dead server cannot pass.
+    $chk = Wait-For -Label "mount appears at $Src" -Seconds 15 -Test {
+      return ((Get-MountState $Src) -eq 'LIVE')
+    }
+    if (-not $chk) {
+      Bad 'Mount failed.'
+      foreach ($l in @($out)) { Inf "    $DIM$l$RS" }
+      Inf ''
+      Inf "  ${BD}Lun ID mismatch$RS warnings are normal. The disk moved to a different controller."
+      Inf "  ${BD}Permission denied$RS means you are not root inside WSL."
+      Inf "  ${BD}Error stat()ing$RS means something still holds $Src. Clear it, then rerun:"
+      Inf "     $DIM wsl -u root -- umount -l $Src$RS"
+      Inf "  ${BD}Cannot open volume$RS usually means the wrong partition. Check the others:"
+      Inf "     $DIM wsl -u root -- lsblk /dev/$SdName$RS"
+      Inf "  ${DIM}The mount is root owned, so run the copier with sudo rather than as yourself.$RS"
+      Write-Host ''; exit 1
+    }
+    Ok "Mounted /dev/$PartName at ${BD}$Src$RS."
+  }
 }
 
 # Proof it worked: a VMFS datastore holds VM folders. An empty mount is a failed
@@ -791,6 +974,37 @@ if (-not $DryRun) {
   }
 }
 
+# Mounted here is not mounted everywhere. Check the WSL windows that are already
+# open before promising the operator that the copier will find anything, because
+# the copier runs in one of them, not in this script's session.
+$Blind = @()
+if (-not $DryRun) {
+  $Blind = @(Get-ShellSessions $Src | Where-Object { $_.State -eq 'BLIND' })
+  if ($Blind.Count -gt 0) {
+    Write-Host ''
+    Note "$($Blind.Count) WSL shell $(if ($Blind.Count -eq 1) { 'session is' } else { 'sessions are' }) open in a different mount namespace and cannot see this mount."
+    foreach ($b in $Blind) { Inf "    $DIM pid $($b.Pid)  $($b.Ns)  $($b.Cmd)$RS" }
+    Inf "  ${DIM}A mount belongs to one namespace. The copier run in those windows would report$RS"
+    Inf "  ${DIM}'$Src exists but is empty' even though the mount here is perfectly good.$RS"
+    $ansN = Ask 'Mount the datastore into those sessions too? [Y/n]' 'y'
+    if ($ansN -match '^[nN]') {
+      Note 'Left them as they are. Mount by hand in the window you will copy from:'
+      Inf "     $DIM sudo vmfs6-fuse /dev/$PartName $Src$RS"
+    } else {
+      foreach ($b in $Blind) {
+        $r = Add-MountToSession $b.Pid "/dev/$PartName" $Src
+        if ($r.Ok) { Ok "pid $($b.Pid) can now see $Src." }
+        else {
+          Bad "Could not mount into the session at pid $($b.Pid)."
+          foreach ($l in @($r.Out)) { if ("$l".Trim()) { Inf "    $DIM$l$RS" } }
+          Inf "  ${DIM}Run this inside that window instead:$RS"
+          Inf "     $DIM sudo vmfs6-fuse /dev/$PartName $Src$RS"
+        }
+      }
+    }
+  }
+}
+
 Write-Host ''; Hr
 if ($DryRun) { Note 'Plan complete. Nothing was attached or mounted, because -DryRun was set.' }
 else { Ok 'Datastore is mounted and readable.' }
@@ -801,6 +1015,11 @@ Inf "     $DIM sudo ./vmfs-copy.sh --src $Src --dest $Dest$RS"
 # and the error it gets back is EACCES on every path, which reads like an empty
 # datastore rather than like a permissions problem.
 Inf "  ${DIM}vmfs6-fuse owns this mount as root, so the copier only reads it under sudo.$RS"
+# Cheap for the operator, and it catches the one failure this script cannot see:
+# a WSL window opened after these checks ran, in a namespace of its own.
+Inf "  ${DIM}Check in that window first: 'ls $Src' must list the VM folders. If it comes$RS"
+Inf "  ${DIM}back empty, that window has its own mount namespace - mount it there:$RS"
+Inf "     $DIM sudo vmfs6-fuse /dev/$PartName $Src$RS"
 Write-Host ''
 Inf "  ${DIM}When the copy is done, unwind cleanly with:$RS"
 Inf "     $DIM .\vmfs-attach.ps1 -Detach$RS"

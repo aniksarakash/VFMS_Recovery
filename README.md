@@ -94,6 +94,7 @@
 **When things go sideways · getting it back up**
 - [♻ Recovering After a Crash](#-recovering-after-a-crash-power-loss-or-wsl-restart)
 - [🚀 Restoring on ESXi 8](#-restoring-on-esxi-8)
+- [🧭 Migrating to New Hardware](MIGRATION.md)
 - [🔧 Troubleshooting Reference](#-troubleshooting-reference)
 - [🧾 Exact Error Messages, Decoded](#-exact-error-messages-decoded)
 - [❓ Frequently Asked Questions](#-frequently-asked-questions)
@@ -547,6 +548,13 @@ flowchart TD
 
 ## 🚀 Restoring on ESXi 8
 
+> [!TIP]
+> Moving to **different** hardware, or hit a networking wall trying to bench the VMs
+> in VMware Workstation first? See **[MIGRATION.md](MIGRATION.md)** — it covers vCPU
+> and RAM budgeting for a smaller host, the `.vswp` space nobody accounts for, what
+> booting in Workstation changes on disk, and why a guest keeping its old subnet
+> cannot be reached from a different one.
+
 After the copy, each recovered folder should hold: the small text descriptor `VMName.vmdk`, the large `VMName-flat.vmdk`, `VMName.vmx`, `VMName.nvram`, maybe `.vmsd`. (The script excludes `*.vswp` swap and `*.log`; keep logs with `--keep-logs`, harmless, just not needed.)
 
 ```mermaid
@@ -590,7 +598,7 @@ vim-cmd vmsvc/getallvms
 vim-cmd vmsvc/power.on <Vmid>
 ```
 
-- Asked **copied vs moved**? Choose **"I copied it"** unless it's a guaranteed 1:1 replacement; "copied" issues a fresh UUID/MAC and avoids conflicts.
+- Asked **copied vs moved**? Choose **"I copied it"** unless it's a guaranteed 1:1 replacement; "copied" issues a fresh UUID/MAC and avoids conflicts. **If the original host is dead and will never run again, that caveat applies to you: pick "I moved it".** It preserves `uuid.bios` (so Windows activation survives) and the original MAC — and a changed MAC makes Windows enumerate a *new* NIC, stranding the guest's static IP on a hidden device that no longer exists. That is the usual reason a restored server comes up with no address.
 - The NIC will likely show disconnected (the old portgroup doesn't exist here); fix under VM Settings → Network Adapter.
 - A hardware-compatibility complaint → use **Upgrade VM Compatibility**, don't rebuild.
 

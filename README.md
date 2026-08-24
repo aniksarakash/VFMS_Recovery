@@ -159,7 +159,7 @@ flowchart TD
     G -- "0B / missing" --> G1["Read-Capacity failure,<br/>reattach, wait longer"] --> E
     G -- Yes --> H["🐧 sudo vmfs6-fuse<br/>/dev/sdX1 /mnt/vmfs"]
     H --> J["🐧 sudo ls -lh /mnt/vmfs"]
-    J --> K["▶ ./vmfs-copy.sh"]
+    J --> K["▶ sudo ./vmfs-copy.sh"]
     K --> L{"Per folder: image<br/>≥ threshold?"}
     L -- Yes --> M["🩺 ddrescue the -flat.vmdk<br/>(sector-level, resumable)"]
     L -- No --> N["📄 rsync the folder<br/>(minus .vswp / .log)"]
@@ -192,12 +192,14 @@ cd VFMS_Recovery
 .\vmfs-attach.ps1 -Mount
 ```
 
-**2. WSL, as your normal user.** Detect the VM folders, pick the ones you want, copy them:
+**2. WSL, as root.** Detect the VM folders, pick the ones you want, copy them:
 
 ```bash
 chmod +x vmfs-copy.sh
-./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
+sudo ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
 ```
+
+`sudo` is not optional here. `vmfs6-fuse` owns the mount as root and does not pass `allow_other`, so to any other user *every* path under `/mnt/vmfs` fails with `EACCES`. Run the copier as yourself and it cannot read one byte of the datastore; it now says so and hands you the `sudo` line rather than claiming the source is missing.
 
 **3. When the copy is finished**, unwind cleanly from Windows:
 
@@ -251,11 +253,11 @@ Illustrative output, showing the two-enclosure case that makes manual attaching 
 
   2. Attach the enclosure to WSL with usbipd
 
-     BUSID   VID:PID     STATE        DEVICE
-   *  3-2     0bda:9210   Shared       USB Attached SCSI (UAS) Mass Storage Device
-   *  6-3     0bda:9201   Not shared   USB Attached SCSI (UAS) Mass Storage Device
+     BUSID   VID:PID     STATE        HOLDS             DEVICE
+   *  3-2     0bda:9210   Shared       disk 2 <-         USB Attached SCSI (UAS) Mass Storage Device
+   *  3-4     0bda:9201   Not shared   disk 3 (D:)       USB Attached SCSI (UAS) Mass Storage Device
 
-  More than one mass storage device is listed. Pick the enclosure, not another external drive.
+  Busid 3-2 is the enclosure holding disk 2.
   BUSID of the enclosure [3-2]: 3-2
   Selected: 3-2  0bda:9210  USB Attached SCSI (UAS) Mass Storage Device
   Already bound (state: Shared).
@@ -279,15 +281,24 @@ Illustrative output, showing the two-enclosure case that makes manual attaching 
   [ok] Datastore is mounted and readable.
 
   Next, inside WSL:
-     ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
+     sudo ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
 ```
 
-### The four things it does that a manual attach doesn't
+Run it a second time (to add `-Mount` to an attach that already happened, say) and step 1 has nothing to do, which it says rather than asking you to pick a disk:
+
+```text
+  1. Take the VMFS disk offline in Windows
+  [ok] 3-2 is already attached to WSL, so Windows no longer owns this disk.
+    Nothing to offline. Skipping to the WSL side.
+```
+
+### The five things it does that a manual attach doesn't
 
 1. **Flags the likely VMFS disk instead of making you count.** The `*` marks any USB disk whose partitions exist but hold no filesystem Windows recognizes and no drive letter. That is precisely the state that makes Windows offer to format the disk, and it is the disk you want. If you pick one Windows *can* read, the script warns before touching it.
-2. **Matches the block device by size, not by name.** `sdX` letters are handed out in attach order, so yesterday's `/dev/sdd` is today's `/dev/sdc`. The script waits for a device whose size matches the Windows disk (within a few sectors) and reports the letter it actually found, then picks the largest partition on it.
-3. **Waits with a visible clock.** Attach and enumeration take anywhere from two to thirty seconds, because the enclosure has to spin up and re-enumerate. A spinner with elapsed seconds is the difference between "working" and "hung", and a timeout ends in a diagnosis rather than a hang: a device listed at `0B` means the enclosure dropped off the bus, which is almost always power.
-4. **Unwinds in the right order.** `-Detach` unmounts the FUSE mount first, then detaches the USB device, then brings the disk back online, and tells you which process is holding the mount if the unmount fails.
+2. **Names the disk behind each USB bridge, and refuses the wrong enclosure.** Attaching a device to WSL *takes it away from Windows*. On a bench with two identical bridge chips, picking the wrong busid does not merely grab the wrong source, it removes the copy destination from Windows, mid-write if a copy is running. The `HOLDS` column resolves each bridge to a disk number (and any drive letters, in red) by walking `DEVPKEY_Device_Parent` from every disk up to its USB node, which carries the serial and so cannot collide between identical chips. That makes the enclosure holding your chosen disk the *default*, and a busid that holds a different disk is refused unless you confirm it by name.
+3. **Matches the block device by size, not by name.** `sdX` letters are handed out in attach order, so yesterday's `/dev/sdd` is today's `/dev/sdc`. The script waits for a device whose size matches the Windows disk (within a few sectors) and reports the letter it actually found, then picks the largest partition on it. On a re-run Windows no longer owns the disk and cannot report a size at all, so it identifies the datastore by its VMFS signature instead: `lsblk` names a `VMFS_volume_member` partition outright, which is a stronger signal than size ever was.
+4. **Waits with a visible clock.** Attach and enumeration take anywhere from two to thirty seconds, because the enclosure has to spin up and re-enumerate. A spinner with elapsed seconds is the difference between "working" and "hung", and a timeout ends in a diagnosis rather than a hang: a device listed at `0B` means the enclosure dropped off the bus, which is almost always power.
+5. **Unwinds in the right order.** `-Detach` unmounts the FUSE mount first, then detaches the USB device, then brings the disk back online, and tells you which process is holding the mount if the unmount fails.
 
 > [!NOTE]
 > The script never formats, partitions, or writes to the source disk. The only changes it makes on Windows are the disk's online/offline state and the `usbipd` binding, both of which `-Detach` reverses.
@@ -303,8 +314,8 @@ Illustrative output, showing the two-enclosure case that makes manual attaching 
 ```text
   VMFS recovery copier
   ────────────────────────────────────────────────────────────────────────
+  ✓ Running as root
   ✓ Source mounted: /mnt/vmfs
-  ✓ sudo cached (VMFS files are root-only, mode 600)
   ✓ ddrescue: /usr/bin/ddrescue
   ✓ Destination: /mnt/d  (244.4G free)
   ✓ Mapfiles/logs: /mnt/d/.vmfs-recovery
@@ -333,6 +344,22 @@ Illustrative output, showing the two-enclosure case that makes manual attaching 
 
 </div>
 
+Run it without root and it stops before scanning, because it cannot read the mount at all. It says which problem that is, and prints back the command you typed with `sudo` in front:
+
+```text
+  ✗ '/mnt/vmfs' is mounted, but its contents cannot be read.
+
+  This is a permissions problem, not a missing datastore.
+  vmfs6-fuse owns the mount as root and does not pass allow_other, so
+  reading it needs root. Rerun exactly as you did, with sudo:
+
+       sudo ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
+
+  Nothing needs reattaching or remounting - the datastore is already up.
+```
+
+That distinction matters more than it looks: the earlier version tested the mount with `[[ -d ]]`, which is *false* when `stat` returns `EACCES`, so a live datastore was reported as **missing** and the full re-attach runbook was printed for work that was already done.
+
 ### The three things it does that a plain `cp` won't
 
 ```mermaid
@@ -356,7 +383,7 @@ flowchart LR
 3. **Excludes what a restore doesn't need**, `*.vswp` swap and `*.log` files are skipped by default (keep the logs with `--keep-logs`).
 
 > [!TIP]
-> **Test the plan before committing to it:** `./vmfs-copy.sh --dry-run` prints the detection table, the space check, and exactly what *would* be copied, and stops. Nothing is written.
+> **Test the plan before committing to it:** `sudo ./vmfs-copy.sh --dry-run` prints the detection table, the space check, and exactly what *would* be copied, and stops. Nothing is written.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
@@ -392,7 +419,7 @@ DISKPART> offline disk
 <summary><strong>Step 2: Attach to WSL2</strong></summary>
 
 > [!TIP]
-> `.mfs-attach.ps1` does steps 1 and 2 in one pass, and waits for the device to finish enumerating instead of leaving you to guess how long that takes.
+> `.\vmfs-attach.ps1` does steps 1 and 2 in one pass, and waits for the device to finish enumerating instead of leaving you to guess how long that takes.
 
 <br/>
 
@@ -415,7 +442,7 @@ You want the drive at its **real size** (e.g. `931.5G`), not `0B`. A partition l
 <summary><strong>Step 3: Mount the VMFS volume</strong></summary>
 
 > [!TIP]
-> `.mfs-attach.ps1 -Mount` does this step as well, installs `vmfs6-tools` if it is missing, and lists the datastore contents afterwards as proof the mount actually worked.
+> `.\vmfs-attach.ps1 -Mount` does this step as well, installs `vmfs6-tools` if it is missing, and lists the datastore contents afterwards as proof the mount actually worked.
 
 <br/>
 
@@ -435,7 +462,7 @@ A `Lun ID mismatch` warning here is **expected and harmless** (see [Troubleshoot
 <br/>
 
 ```bash
-./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
+sudo ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
 ```
 
 Pick folders when prompted (`1 3`, `1-3`, `all`, or `q`). The script handles the per-file engine choice, the progress bar, and the size verification for you. Prefer the manual approach or want to understand what it runs under the hood? The equivalent by hand:
@@ -500,7 +527,7 @@ flowchart TD
     I -- No --> L
     L --> M{"'No such device'?"}
     M -- Yes --> N["sudo mount -t drvfs D: /mnt/d"] --> L
-    M -- "lists fine" --> O["▶ ./vmfs-copy.sh, same flags.<br/>Detection shows 'partial %',<br/>ddrescue resumes from mapfile"]
+    M -- "lists fine" --> O["▶ sudo ./vmfs-copy.sh, same flags.<br/>Detection shows 'partial %',<br/>ddrescue resumes from mapfile"]
 
     classDef win fill:#0F2027,stroke:#0078D6,color:#fff;
     classDef nix fill:#1b2b34,stroke:#39BAE6,color:#fff;
@@ -605,7 +632,26 @@ vmkfstools -i "/vmfs/volumes/<datastore>/VMName/VMName.vmdk" \
 
 <br/>**Cause:** the mount was done with `sudo`, so the FUSE mount is root-owned with `default_permissions`, and the VM files underneath are `-rw-------` (mode 600), normal for VMFS.
 
-**Fix:** nothing's broken; prefix every command touching `/mnt/vmfs` with `sudo`. (`vmfs-copy.sh` does this for you, and caches the sudo timestamp so it won't re-prompt mid-copy.)
+**Fix:** nothing's broken; prefix every command touching `/mnt/vmfs` with `sudo`, and run the copier itself as `sudo ./vmfs-copy.sh`. It routes every read through `sudo` internally and, if you start it unprivileged, caches the credential and refreshes it every 50 seconds so a multi-hour `ddrescue` cannot stall on an expired timestamp.
+</details>
+
+<details>
+<summary><strong>🔧 The copier says the source "does not exist" but you just mounted it</strong></summary>
+
+<br/>**Cause:** you are not root. `vmfs6-fuse` mounts with `user_id=0` and without `allow_other`, so to any other user *every* path under the mountpoint fails with `EACCES`, and a `[[ -d ]]` test on an `EACCES` path is false. A perfectly good datastore therefore looked absent.
+
+**Fix:** rerun with `sudo`. The script now asks `/proc/mounts` (readable unprivileged) instead of trusting `stat`, so a current version diagnoses this by name and hands you the exact command rather than printing the re-attach runbook.
+```bash
+sudo ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
+```
+</details>
+
+<details>
+<summary><strong>🔧 <code>vmfs-attach.ps1</code> asks which disk to offline, and the VMFS disk isn't listed</strong></summary>
+
+<br/>**Cause:** the enclosure is *already* attached to WSL. `usbipd attach` removes the device from Windows, so `Get-Disk` cannot see that disk at all, and the list you're looking at is the other drives on the bench, one of which is your copy destination.
+
+**Fix:** don't pick anything. A current version detects this before step 1 and skips it (`3-2 is already attached to WSL, so Windows no longer owns this disk`), then identifies the datastore inside WSL by its VMFS signature rather than by a size Windows can no longer report. If you're on an older copy, run `.\vmfs-attach.ps1 -DryRun` to see the real state, or `-Detach` to unwind and start clean.
 </details>
 
 <details>
@@ -680,7 +726,11 @@ The literal strings this recovery produces, so you can match what's on your scre
 | What you see | Where | What it actually means | Do this |
 |---|---|---|---|
 | `VMFS: Warning: Lun ID mismatch` | `vmfs6-fuse` mount | The volume still records the original host's LUN ID, which a USB enclosure can't match | **Nothing.** It's a warning; the mount succeeds |
-| `ls: cannot open directory '/mnt/vmfs': Permission denied` | after mounting | VM files on VMFS are mode `600` and the FUSE mount is root-owned | Prefix with `sudo` (the script does this for you) |
+| `ls: cannot open directory '/mnt/vmfs': Permission denied` | after mounting | VM files on VMFS are mode `600` and the FUSE mount is root-owned | Prefix with `sudo` (the copier routes its own reads through it) |
+| `Source '/mnt/vmfs' does not exist` | copier startup | You are not root, so `stat` on the mount returns `EACCES` and the existence test came back false | Rerun as `sudo ./vmfs-copy.sh`; current versions say "cannot be read" instead |
+| `'/mnt/vmfs' is mounted, but its contents cannot be read` | copier startup | The mount is up and root-owned; nothing is broken | Rerun the same command with `sudo` |
+| `sudo needs a password and there is no terminal to ask on` | copier startup | Started without a TTY (a wrapper, `nohup`, a hook) so the password prompt had nowhere to go | Rerun as `sudo ./vmfs-copy.sh`, or pre-cache with `sudo -v` first |
+| `Busid 3-4 holds disk 2, not disk 1` | `vmfs-attach.ps1` step 2 | The chosen busid is the *other* enclosure; attaching it would take that disk away from Windows | Answer `n` and pick the busid the `HOLDS` column points at with `<-` |
 | `lsblk` shows the disk as `0B` | after `usbipd attach` | The kernel hit a `Read Capacity` failure or hasn't finished enumerating | `sleep 15`, then detach and reattach |
 | `Input/output error` | mid-copy | A physically unreadable sector on the source | Route that file through `ddrescue`, not `cp`/`rsync` |
 | `rsync: ... file has vanished` | mid-copy | Same bad-sector read failure, reported by `rsync` | Confirm with `dmesg \| tail -30`, then use `ddrescue` |
@@ -752,6 +802,14 @@ Because several I/O-heavy jobs running at once through WSL2's virtualized USB st
 
 Yes. While Windows holds the disk online it keeps the device claimed, and `usbipd bind` or `usbipd attach` will report the device as in use. Offline it first with `diskpart` (`select disk N`, `offline disk`) or let [`vmfs-attach.ps1`](vmfs-attach.ps1) do it. Offline is also the safer state: while the VMFS disk is online, Windows repeatedly offers to format it, because it cannot read the filesystem.
 
+### Do I have to run the copier with sudo?
+
+In practice, yes. `vmfs6-fuse` mounts the datastore as root without `allow_other`, so every path under `/mnt/vmfs` returns `EACCES` to anyone else. The copier routes each read through `sudo` internally, so starting it as your normal user *can* work, it caches the credential and refreshes it every 50 seconds so a multi-hour `ddrescue` cannot stall on an expired timestamp. `sudo ./vmfs-copy.sh` is still the better habit: it removes that dependency entirely, and it cannot be caught by a password prompt with no terminal to answer it.
+
+### Is it safe to re-run `vmfs-attach.ps1` after a successful attach?
+
+Yes, and it's the normal way to add `-Mount` to an attach you already did. It detects that the enclosure is already handed to WSL and skips the offline step rather than asking you to pick a disk, which matters because `usbipd attach` removes the device from Windows: at that point `Get-Disk` lists only the *other* drives on the bench, one of which is your copy destination. Every step is idempotent, an already-bound device isn't re-bound, an already-mounted datastore isn't remounted.
+
 ### Does the copier script handle the diskpart and usbipd steps?
 
 No, and it cannot. `vmfs-copy.sh` runs inside WSL, and `diskpart` and `usbipd` are Windows executables that need an elevated Windows shell, so from inside WSL there is no way to offline a Windows disk or bind a USB device to itself. That is what [`vmfs-attach.ps1`](vmfs-attach.ps1) is for. If the datastore is not mounted, the copier now refuses to start and prints all three prerequisite steps, because a missed step and an empty datastore look identical from inside WSL.
@@ -787,13 +845,13 @@ The copy then starts from zero, which is correct, because there is nothing on th
 | `-Dest <path>` | `/mnt/d` | Destination drive, used only in the closing hint |
 | `-Distro <name>` | default distro | Which WSL distro to work in |
 | `-Yes` | off | Accept the detected defaults, no prompts |
-| `-DryRun` | off | Print every action, change nothing |
+| `-DryRun` | off | Print every action, change nothing. The only mode that runs **unelevated**, so you can read the plan from a normal shell |
 | `-TimeoutSec <n>` | `90` | How long to wait for attach and for the block device to appear |
 
 ### `vmfs-copy.sh` (WSL)
 
 ```text
-./vmfs-copy.sh [options]
+sudo ./vmfs-copy.sh [options]
 ```
 
 | Flag | Default | Does |

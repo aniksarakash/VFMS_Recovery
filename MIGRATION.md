@@ -285,7 +285,7 @@ the flat file disagree, stop - you have mixed two captures. Which brings us to:
 The small files - `.vmx`, the `.vmdk` descriptor, `.nvram` - are only meaningful next to
 the exact `-flat.vmdk` they were read with. **This has already gone wrong once here.**
 
-`D:\IP_44.10_MyQ test Server (production)` was found holding a metadata set from one
+`D:\IP_44.10_MyQ test Server` was found holding a metadata set from one
 capture beside a flat image copied from another. Both describe the same VM - identical
 `uuid.bios`, `vc.uuid`, `vm.createDate` and MAC - but at two different points in its
 life:
@@ -311,8 +311,28 @@ installed alongside. Nothing on `/mnt/vmfs` was touched; the mount is read-only.
 
 | Folder on `D:` | State |
 |---|---|
-| `IP_44.10_MyQ test Server (production)` | Image **complete** (`# Finished`, 96,636,764,160 bytes). Metadata reconciled. `IP_44.10_MyQ test Server.vmx` is the **T130-ready** file; `.vmx.original` is the pristine source copy |
-| `44.13_CMS_Ticketing_System` | Image **still copying**. `.vmx.original` is the pristine source copy; `.vmx.t130` is the T130-ready file, held under that name so the copier's rsync pass cannot overwrite it |
+| `IP_44.10_MyQ test Server` | Image **complete** (`# Finished`, 96,636,764,160 bytes). Metadata reconciled and edits applied |
+| `44.13_CMS_Ticketing_System` | Image **still copying**. Edits staged under `.vmx.t130`, held under that name so the copier's rsync pass cannot overwrite them |
+
+Every file, and what it is for:
+
+| File | What it is | Keep? |
+|---|---|---|
+| `<name>-flat.vmdk` | The image. 96,636,764,160 bytes | **yes** - this is the recovery |
+| `<name>.vmx` | **The T130-ready file.** MyQ's is edited; 44.13's arrives untouched and is replaced from `.vmx.t130` | yes - this is what you import |
+| `<name>.vmx.t130` | 44.13 only - the edited file, waiting for its `.vmx` slot | until you rename it |
+| **`<name>.vmx.original`** | **Byte-identical copy of the vmx on `/mnt/vmfs`.** Verified with `cmp` | **keep permanently** |
+| **`<name>.vmx.bak-<stamp>`** | **The metadata that was already in the folder** before reconciliation - the set from the other capture | **keep permanently** |
+| **`<name>.vmdk.bak-<stamp>`**, **`<name>.nvram.bak-<stamp>`** | Same, for the descriptor and the EFI variables | **keep permanently** |
+| `<name>.vmdk`, `<name>.nvram`, `<name>.vmsd` | The set that matches this image, copied from the live mount | yes |
+| `vm*.scoreboard` | ESXi bookkeeping. Stale ones are harmless - ESXi recreates them | either way |
+
+> [!IMPORTANT]
+> **Nothing in this folder is deleted, at any step.** The `.original` and `.bak-*` files
+> are the reason every edit here is reversible without going back to the source drive.
+> A single `cp "<name>.vmx.original" "<name>.vmx"` puts the machine back exactly as it
+> came off the datastore. They cost a few kilobytes; keep them for the life of the
+> archive.
 
 > [!IMPORTANT]
 > When the copier finishes `44.13`, its rsync pass writes the untouched
@@ -330,6 +350,8 @@ installed alongside. Nothing on `/mnt/vmfs` was touched; the mount is read-only.
 1. **Never boot the archive copy.** Boot a working copy, or use a non-persistent disk.
 2. **Never write to `/mnt/vmfs`.** It is the only copy of the pre-restore state and, in
    an incident, it is evidence.
+3. **Never delete an `.original` or a `.bak-*`.** Edits are only safe because the
+   unedited file is still sitting beside them.
 
 ---
 
@@ -435,18 +457,84 @@ flowchart LR
 
 Both VMs specify `ethernet0.networkName = "VM Network"` - the ESXi default portgroup.
 Confirm it exists and that its vSwitch has a live uplink. The real question is which
-network that uplink sits on:
+network that uplink sits on.
+
+#### The three networks in play
+
+These are separate questions and it is easy to conflate them. The old host's own
+management address was recovered from `vmware.log`:
+
+| Network | Address | Where it came from |
+|---|---|---|
+| **Old ESXi host management** | `172.17.42.130/24`, `vmk0` | `IP=172.17.42.130 (vmk0)` in the source `vmware.log`. The host's hostname was never set - it logged as `localhost.localdomain` |
+| **The guests** | `172.17.44.x/24`, gw `172.17.44.1` | Your report from the failed Workstation attempts |
+| **Bench laptop / office LAN** | `192.168.90.171`, `255.255.252.0` -> `192.168.88.0/22`, gw `192.168.89.1` | Your report |
+
+> [!NOTE]
+> **`172.17.42.0/24` and `172.17.44.0/24` are different networks.** Management lived on
+> `.42`, the guests on `.44`. When you ask the switch administrator what still reaches
+> the T130's port, name the one you mean - and remember the T130 needs an answer for
+> *both*: an address for its own management interface, and a path for the guest
+> portgroup. They do not have to be the same network, and on the old host they were not.
+
+#### What the guests' own addresses are
+
+**Not recorded in anything recovered.** A static IP lives in the guest's registry, not
+in the vmx, and VMware Tools' reported address is not in the surviving logs. The folder
+names are the only hint, and they do not fully agree with each other:
+
+| Evidence | Suggests |
+|---|---|
+| Folder `IP_44.10_MyQ test Server` | `172.17.44.10` |
+| Folder `44.13_CMS_Ticketing_System` | `172.17.44.13` |
+| MyQ's `displayName`: `IP_44.20_RND_Test_TicketingSystem` | `172.17.44.20` - **conflicts with its own folder name** |
+
+Treat all three as guesses. You will read the real values off the console on first boot
+anyway, and you have to open the console regardless because of the ghost NIC (1.7).
+
+#### Deciding the uplink
 
 | Situation | What to do | Guest changes |
 |---|---|---|
 | `172.17.44.0/24` still reaches the T130 | Put the uplink on it, or set the portgroup's **VLAN ID** if the switch port is a trunk | **None.** The guests keep their addresses and simply work |
 | Only `192.168.88.0/22` is available | Re-address each guest: `192.168.90.xxx` / `255.255.252.0` / gw `192.168.89.1` | Console in and set the static IP |
 
-Aim for the first row - ask whoever runs the switch whether `172.17.44.0/24` is still
-trunked to the port the T130 will use. Either way the MAC changes on import (both use
-`addressType = "generated"`), so **plan on console access** rather than expecting either
-server to appear on the network by itself. See 1.7 for why that matters more than it
-sounds.
+Aim for the first row. Rather than only asking, you can **test it** before either VM is
+involved - give ESXi a throwaway vmkernel port on the guest network and see whether the
+gateway answers:
+
+```sh
+# temporary probe on the guest network - remove it afterwards
+esxcli network ip interface add --interface-name=vmk1 --portgroup-name="VM Network"
+esxcli network ip interface ipv4 set --interface-name=vmk1 \
+  --ipv4=172.17.44.250 --netmask=255.255.255.0 --type=static
+ping -I vmk1 172.17.44.1
+esxcli network ip interface remove --interface-name=vmk1     # always clean this up
+```
+
+A reply means the network is present on that port untagged. Silence means it is either
+absent, or tagged - try a VLAN ID on the portgroup and probe again:
+
+```sh
+esxcli network vswitch standard portgroup set -p "VM Network" --vlan-id=<ID>
+esxcli network vswitch standard portgroup list                # confirm the tag
+```
+
+#### Moving off quarantine
+
+Once the scan is clean and credentials are rotated, move each adapter from `quarantine`
+to the production portgroup. This is a Host Client edit on the VM's network adapter, or
+from the shell:
+
+```sh
+vim-cmd vmsvc/getallvms                                       # find the Vmid
+vim-cmd vmsvc/devices.getdevices <Vmid> | grep -i network     # confirm the label
+# then set the adapter's portgroup to "VM Network" in the Host Client and reconnect it
+```
+
+Either way the MAC changes on import (both use `addressType = "generated"`), so **plan
+on console access** rather than expecting either server to appear on the network by
+itself. See 1.7 for why that matters more than it sounds.
 
 ### 1.5 Pre-flight vmx edits
 
@@ -796,11 +884,64 @@ switch, so MyQ can keep `172.17.44.x` untouched. You can even give it **two NICs
 address - which lets you confirm the application binds correctly to the address it
 expects without touching the office network at all.
 
-**If you insist on bridged** and it still fails after binding VMnet0 explicitly to
-`Ethernet 2`, the remaining suspects are: the USB chipset not supporting promiscuous
-mode (unfixable - use NAT); **the office switch port enforcing port security / MAC
-limiting**, which silently drops the VM's second MAC and is invisible from your end -
-ask the switch administrator; or WARP/Tailscale still capturing routes.
+### 2.7.1 Settling the bridged question properly
+
+Bridged was tried and it did not work. But **those attempts could not have told you
+whether the bridge itself was working**, because the guest held a static
+`172.17.44.x/24` address the whole time. On a `192.168.88.0/22` wire that guest is
+unreachable whether the bridge is perfect or completely broken - Cause 1 masks the
+answer to Cause 2. Every bridged test so far has been measuring the wrong thing.
+
+**The test that separates them: bridge, then set the guest to DHCP.**
+
+A DHCP lease from the office scope is proof the bridge carries frames in both
+directions at layer 2. No lease means the bridge is genuinely broken. Either way you
+learn something the static-IP attempts could not tell you.
+
+1. **Virtual Network Editor** (Edit -> Virtual Network Editor -> **Change Settings**,
+   which needs elevation) -> **VMnet0** -> *Bridged to:* select **`Ethernet 2`**
+   explicitly. Never `Automatic` - with the bridge protocol bound to everything,
+   Automatic picks unpredictably.
+2. Confirm only the intended adapter is bound, then restart the bridge service so the
+   new binding takes effect:
+
+   ```powershell
+   Get-NetAdapterBinding -ComponentID vmware_bridge | Where-Object Enabled |
+     Select-Object Name, Enabled            # expect: Ethernet 2 only
+   Restart-Service VMnetBridge -Force       # bindings are read at service start
+   ```
+3. **Disconnect Cloudflare WARP** and stop Tailscale for the duration of the test.
+4. In the guest: `ethernet0.connectionType = "bridged"`, `ethernet0.vnet = "VMnet0"`,
+   and set the adapter to **Obtain an IP address automatically**.
+5. Boot and check with `ipconfig /all`.
+
+| What the guest gets | What it means | Next step |
+|---|---|---|
+| A `192.168.88-91.x` lease | **The bridge works.** Cause 1 was the only real problem | Give it a static `192.168.90.200` / `255.255.252.0` / gw `192.168.89.1`, or leave it on DHCP |
+| `169.254.x.x` (APIPA) | No DHCP reply reached the guest - the bridge is not passing frames | Continue to the suspects below |
+| No adapter at all, or a second one | The ghost NIC (Cause 4) - you are configuring an invisible device | Clear it per Cause 4, then retry from step 4 |
+
+**If there is still no lease**, the remaining suspects, in the order worth checking:
+
+| Suspect | How to tell | Fix |
+|---|---|---|
+| **Ghost NIC still present** | `devmgmt.msc` with hidden devices shown lists a greyed-out adapter | Remove it (Cause 4). Re-test before blaming anything else |
+| **WARP or Tailscale still up** | `Get-NetRoute -DestinationPrefix 0.0.0.0/0` shows a tunnel interface with the lowest metric | Disconnect both, `Restart-Service VMnetBridge -Force`, re-test |
+| **USB chipset has no promiscuous mode** | Capture on `Ethernet 2` in Wireshark with promiscuous enabled while two *other* machines ping each other. Seeing only broadcast and your own traffic means the adapter filters by MAC | **Unfixable.** Use NAT + port forwarding |
+| **Switch port security / MAC limiting** | Invisible from the laptop. The port accepts the host's MAC and silently drops the VM's second one | Ask the switch administrator to allow a second MAC on that port, or use NAT |
+| **Adapter owned by a Hyper-V external vSwitch** | `Get-VMSwitch` lists an external switch bound to `Ethernet 2` | Remove that switch, or bridge to a different adapter |
+
+> [!NOTE]
+> **The order matters.** Port security and a filtering USB chipset produce *identical*
+> symptoms from your side - no lease, no error. The only difference is that one is
+> yours to fix and the other is not. Clearing the ghost NIC and the tunnels first is
+> what makes the remaining two worth asking about, and it is why the Wireshark check is
+> the one test that distinguishes them without involving the switch administrator.
+
+**Wi-Fi is not a fallback here.** Workstation bridges 802.11 by rewriting the guest's
+MAC to the host's, which works for DHCP clients and breaks for static addressing and
+anything that cares about the guest's real MAC. If `Ethernet 2` cannot bridge, the
+answer is NAT, not Wi-Fi.
 
 **Re-addressing MyQ to the office subnet**, if you go that way - clear the ghost NIC
 first, then on the live adapter:
@@ -905,7 +1046,7 @@ Get-ChildItem $vm -Filter '*.lck' -Force | Remove-Item -Recurse -Force
 # --- transfer to the T130, re-thinning on the way in ---
 & "C:\Program Files (x86)\VMware\VMware Workstation\OVFTool\ovftool.exe" `
   --acceptAllEulas --noSSLVerify --diskMode=thin --name="IP_44.10_MyQ" `
-  "D:\IP_44.10_MyQ test Server (production)\IP_44.10_MyQ test Server.vmx" `
+  "D:\IP_44.10_MyQ test Server\IP_44.10_MyQ test Server.vmx" `
   "vi://root@T130-IP/?dcPath=ha-datacenter&dsName=datastore1"
 
 & "C:\Program Files (x86)\VMware\VMware Workstation\OVFTool\ovftool.exe" `

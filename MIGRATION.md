@@ -117,10 +117,10 @@ Both columns were read directly from the `.vmx` on the mounted datastore.
 
 | Property | `IP_44.10_MyQ test Server` | `44.13_CMS_Ticketing_System` |
 |---|---|---|
-| Display name in the inventory | `IP_44.20_RND_Test_TicketingSystem` | `44.13_CMS_Ticketing_System` |
+| Display name in the inventory | `IP_44.10_RND_MOST_Inportand Do shutdown` | `44.13_CMS_Ticketing_System` |
 | Disk | `nvme0:0`, 90 GiB apparent / **77.03 GiB allocated** | `nvme0:0`, 90 GiB apparent / **90.00 GiB allocated** |
-| `numvcpus` | **absent - so 1** | **8** |
-| `memSize` | **8192** | **16384** |
+| `numvcpus` | **8** | **8** |
+| `memSize` | **24576** | **16384** |
 | `cpuid.coresPerSocket` | `1` | `4` |
 | Hardware version | `20` (ESXi 7.0 U2) - **runs natively on ESXi 8** | `20` - same |
 | Firmware | `efi`, **Secure Boot ON** (`uefi.secureBoot.enabled = "TRUE"`) | `efi`, **Secure Boot ON** |
@@ -130,6 +130,22 @@ Both columns were read directly from the `.vmx` on the mounted datastore.
 | CD-ROM | ISO on volume `6410a09e-...`, `startConnected` absent | ISO on volume `6410a09e-...`, **`startConnected = "TRUE"`** |
 | Snapshots | **none** - no `.vmss`/`.vmsn`/`.vmem`, no `-00000N.vmdk` chain | **none** |
 | State at failure | **`cleanShutdown = "TRUE"`** - shut down properly | **`cleanShutdown = "FALSE"`**, live `.vswp` and a stale `.vmx.lck` |
+
+> [!IMPORTANT]
+> **MyQ exists in two configurations, and only one of them is production.** Both carry
+> the same `uuid.bios`, the same `vc.uuid` and the same MAC, so they are the same
+> machine - but they describe it at two points in its life:
+>
+> | | `displayName` | `numvcpus` | `memSize` |
+> |---|---|---|---|
+> | **Production - use this** | `IP_44.10_RND_MOST_Inportand Do shutdown` | `8` | `24576` |
+> | Test role | `IP_44.20_RND_Test_TicketingSystem` | *absent* (1) | `8192` |
+>
+> The `44.20` test configuration is the one sitting in the folder on the currently
+> mounted datastore. It is **not** what you restore - it is the same disk pointed at a
+> test ticketing role, matching the `Test` folder elsewhere on the volume. The row above
+> and every figure in Part 1 use the **44.10 production** values. Both files are kept:
+> see 0.3.
 
 Two consequences worth planning around:
 
@@ -292,20 +308,39 @@ life:
 
 | Key | Metadata already on `D:` | Current source |
 |---|---|---|
-| `displayName` | `IP_44.10_RND_MOST_Inportand Do shutdown` | `IP_44.20_RND_Test_TicketingSystem` |
-| `numvcpus` | `8` | *absent* (so 1) |
-| `memSize` | `24576` | `8192` |
+| `displayName` | **`IP_44.10_RND_MOST_Inportand Do shutdown`** | `IP_44.20_RND_Test_TicketingSystem` |
+| `numvcpus` | **`8`** | *absent* (so 1) |
+| `memSize` | **`24576`** | `8192` |
 | `numa.autosize.cookie` | `80012` | `10012` |
 | descriptor `CID` | `d99d2416` | `70cf1e98` |
 | `.nvram` | differs from byte 21 onward | - |
 | `uuid.bios`, `vc.uuid`, MAC | **identical** | **identical** |
 
-A CID mismatch is not fatal for a standalone flat disk - ESXi only enforces it across a
-parent/child chain - but the `.nvram` is a different matter, because the EFI boot entry
-lives in it. **Use the set that came off the same read as the image.**
+**The two halves of this do not resolve the same way, and treating them as one question
+is a mistake.**
 
-The mismatched files were preserved as `*.bak-<timestamp>` and the matching set
-installed alongside. Nothing on `/mnt/vmfs` was touched; the mount is read-only.
+| File | Which copy wins | Why |
+|---|---|---|
+| **`.vmx`** | **The `44.10` production one already on `D:`** | A vmx has **no binding to image content** - it names the `.vmdk` by filename and nothing more. So the tie-breaker is not "which read did it come from" but "which configuration is the one you are restoring". That is the production one: `44.10`, 8 vCPU, 24576 MB. The `44.20` variant is the same disk in a test ticketing role |
+| `.nvram` | The one from the same read as the image | EFI boot variables reference the ESP **by partition GUID**. An nvram from a different capture can point at a partition this image does not have - which is exactly the *no operating system found* failure |
+| `.vmdk` descriptor | The one from the same read as the image | Harmless either way for a standalone flat - ESXi enforces `CID` only across a parent/child chain - so match it on principle rather than necessity |
+
+Nothing is deleted. Both vmx variants are kept under names that say which is which:
+
+```
+IP_44.10_MyQ test Server.vmx                      <- T130-ready, built from the 44.10 production config
+IP_44.10_MyQ test Server.vmx.production-original  <- pristine 44.10 production vmx
+IP_44.10_MyQ test Server.vmx.testcfg-original     <- pristine 44.20 test vmx, from the live mount
+IP_44.10_MyQ test Server.nvram.production-original
+IP_44.10_MyQ test Server.vmdk.production-original
+```
+
+> [!TIP]
+> If MyQ boots to *no operating system found*, swap the nvram before anything else -
+> `cp "<name>.nvram.production-original" "<name>.nvram"`. That is the one file where the
+> two captures can genuinely disagree in a way that stops the machine booting.
+
+Nothing on `/mnt/vmfs` was touched; the mount is read-only.
 
 ### 0.4 What is on the destination now
 
@@ -378,31 +413,40 @@ stalls even where it is permitted.
 
 | VM | Configured | **Use** | `cpuid.coresPerSocket` |
 |---|---|---|---|
-| MyQ | *absent* (1) | **2** | `1` - 1 divides into 2 |
+| MyQ | 8 | **4** | `1` - 1 divides into 4 |
 | 44.13 | 8 | **4** | `4` - 4 divides into 4 |
 
 `cpuid.coresPerSocket` must divide evenly into `numvcpus` or power-on errors out. Both
-pairings above satisfy that. Six vCPU total against four cores is a mild overcommit,
-which is fine for two lightly loaded servers; drop 44.13 to 2 if the host reports 4
-threads and both VMs need to run hot at once.
+pairings above satisfy that. Eight vCPU total against four cores is a 2:1 overcommit,
+which is fine for two servers that are not both busy at once; drop 44.13 to 2 if the
+host reports 4 threads and they are.
 
 ### 1.2 RAM budget on 32 GB
 
 Reserve roughly **6 GB** for ESXi 8 and its agents, leaving ~26 GB for guests.
 
-| VM | Configured `memSize` | Guest | `.vswp` on datastore |
-|---|---|---|---|
-| MyQ | **8192** | 8 GB | 8 GiB |
-| 44.13 | **16384** | 16 GB | 16 GiB |
-| **Total** | | **24 GB** | **24 GiB** |
+**Neither machine's configured size fits alongside the other.** MyQ is configured for
+24576 and 44.13 for 16384 - 40 GB against a ~26 GB budget. Something has to give, and
+MyQ is the production application, so it keeps the larger share:
 
-24 GB of guests against ~26 GB available **fits, and leaves about 2 GB of slack** - so
-**leave both `memSize` values alone.** They are each machine's own configured size, and
-together they land inside the budget without anyone having to guess a new number.
+| VM | Configured | **Use** | Guest | `.vswp` on datastore |
+|---|---|---|---|---|
+| MyQ | 24576 | **16384** | 16 GB | 16 GiB |
+| 44.13 | 16384 | **8192** | 8 GB | 8 GiB |
+| **Total** | 40 GB - too much | | **24 GB** | **24 GiB** |
 
-If you need headroom later, MyQ is the one to trim: it is the smaller workload and its
-`.vswp` shrinks with it. Raising 44.13 above 16384 does not fit while MyQ is also
-running.
+24 GB of guests against ~26 GB available fits and leaves about 2 GB of slack.
+
+Both trims are one line, and both are reversible the moment the other VM is not running:
+
+| If you run... | You can give it |
+|---|---|
+| **MyQ alone** | `memSize = "24576"` - its full production size. ~7 GB left for ESXi, which is tight but workable |
+| **44.13 alone** | `memSize = "16384"` - its own configured size |
+| **Both** | The 16384 / 8192 split above |
+
+Start with the split. Raise MyQ later if the application actually needs it - that is a
+one-line vmx change and a reboot, whereas a starved host is harder to diagnose.
 
 ### 1.3 Storage budget - do not forget the swap files
 
@@ -413,9 +457,13 @@ is real datastore space, on top of the disks.
 |---|---|---|
 | MyQ disk | 90 GiB | ~77 GiB |
 | 44.13 disk | 90 GiB | ~90 GiB (fully allocated on the source) |
-| MyQ `.vswp` at 8 GB | 8 GiB | 8 GiB |
-| 44.13 `.vswp` at 16 GB | 16 GiB | 16 GiB |
+| MyQ `.vswp` at 16 GB | 16 GiB | 16 GiB |
+| 44.13 `.vswp` at 8 GB | 8 GiB | 8 GiB |
 | **Total free needed** | **~204 GiB** | **~191 GiB** |
+
+If you give MyQ its full 24576 and run it alone, the requirement is **~114 GiB** thick
+or **~101 GiB** thin - the swap file grows with `memSize`, so it moves with every change
+you make above.
 
 ```sh
 df -h /vmfs/volumes/datastore1
@@ -468,7 +516,7 @@ management address was recovered from `vmware.log`:
 |---|---|---|
 | **Old ESXi host management** | `172.17.42.130/24`, `vmk0` | `IP=172.17.42.130 (vmk0)` in the source `vmware.log`. The host's hostname was never set - it logged as `localhost.localdomain` |
 | **The guests** | `172.17.44.x/24`, gw `172.17.44.1` | Your report from the failed Workstation attempts |
-| **Bench laptop / office LAN** | `192.168.90.171`, `255.255.252.0` -> `192.168.88.0/22`, gw `192.168.89.1` | Your report |
+| **The T130, on the office LAN** | `192.168.90.171`, `255.255.252.0` -> `192.168.88.0/22`, gw `192.168.89.1` | Your report. **This is the T130's address, not the laptop's** - see 2.0 |
 
 > [!NOTE]
 > **`172.17.42.0/24` and `172.17.44.0/24` are different networks.** Management lived on
@@ -486,11 +534,14 @@ names are the only hint, and they do not fully agree with each other:
 | Evidence | Suggests |
 |---|---|
 | Folder `IP_44.10_MyQ test Server` | `172.17.44.10` |
+| MyQ's production `displayName`: `IP_44.10_RND_MOST_...` | `172.17.44.10` - **agrees with the folder** |
 | Folder `44.13_CMS_Ticketing_System` | `172.17.44.13` |
-| MyQ's `displayName`: `IP_44.20_RND_Test_TicketingSystem` | `172.17.44.20` - **conflicts with its own folder name** |
+| MyQ's *test* `displayName`: `IP_44.20_RND_Test_TicketingSystem` | `172.17.44.20` - the test role, not this restore |
 
-Treat all three as guesses. You will read the real values off the console on first boot
-anyway, and you have to open the console regardless because of the ghost NIC (1.7).
+The production name and the folder name agree on `.10`, so that one is well supported.
+They are still inferences from names rather than recovered configuration - you will read
+the real values off the console on first boot anyway, and you have to open the console
+regardless because of the ghost NIC (1.7).
 
 #### Deciding the uplink
 
@@ -549,8 +600,8 @@ What changed, and why:
 | `sata0:0.deviceType` -> `"atapi-cdrom"` | yes | yes | The ISO lived on volume `6410a09e-...`, which the T130 will not have |
 | `sata0:0.fileName` -> `"auto detect"` | yes | yes | as above |
 | `sata0:0.startConnected` -> `"FALSE"` | added | **changed from `TRUE`** | On 44.13 this is the difference between a clean power-on and an error about a missing ISO |
-| `numvcpus` | **added as `2`** (was absent) | `8` -> **`4`** | 1.1 |
-| `memSize` | unchanged at `8192` | unchanged at `16384` | 1.2 |
+| `numvcpus` | `8` -> **`4`** | `8` -> **`4`** | 1.1 |
+| `memSize` | `24576` -> **`16384`** | `16384` -> **`8192`** | 1.2 - neither fits alongside the other at its configured size |
 | `cpuid.coresPerSocket` | unchanged at `1` | unchanged at `4` | Both divide evenly into the new `numvcpus` |
 | `numa.autosize.cookie` | **deleted** | **deleted** | Baked to the dead host's topology; ESXi regenerates it |
 | `numa.autosize.vcpu.maxPerVirtualNode` | **deleted** | **deleted** | as above |
@@ -566,8 +617,8 @@ sata0:0.fileName       = "auto detect"
 sata0:0.startConnected = "FALSE"
 
 # --- right-size for a 4-core / 32 GB host (see 1.1 and 1.2) ---
-numvcpus             = "2"      # MyQ    - 44.13 gets "4"
-# memSize left alone: 8192 for MyQ, 16384 for 44.13
+numvcpus             = "4"      # both VMs, down from 8
+memSize              = "16384"  # MyQ, down from 24576  - 44.13 gets "8192", down from 16384
 cpuid.coresPerSocket = "1"      # MyQ    - 44.13 keeps "4"
 
 # --- delete outright: all four are baked to the dead host ---
@@ -583,7 +634,7 @@ cpuid.coresPerSocket = "1"      # MyQ    - 44.13 keeps "4"
 |---|---|---|
 | `virtualHW.version` | `20` | ESXi 8 runs it natively. Changing it removes your fallback to a 7.x host |
 | `uefi.secureBoot.enabled` | `TRUE` on both | ESXi 8 supports VM Secure Boot. The guests were measured with it on; turning it off can disturb BitLocker and Credential Guard |
-| `displayName` | as-is | MyQ's reads `IP_44.20_RND_Test_TicketingSystem`, which is confusing but is the machine's own name. Pass `--name` to `ovftool` if you want a clearer one in the inventory |
+| `displayName` | as-is | MyQ's reads `IP_44.10_RND_MOST_Inportand Do shutdown` - its production name. Pass `--name` to `ovftool` if you want a tidier one in the inventory |
 | `uuid.bios`, `vc.uuid` | as-is | `uuid.bios` is what Windows activation is bound to |
 | `nvme1.present` on 44.13 | `TRUE` | A controller with no disk on it. Harmless, and removing it reshuffles PCI slots, which the guest notices |
 | `vhv.enable`, `vvtd.enable`, `windows.vbs.enabled` on 44.13 | `TRUE` | See 1.8 - these are a decision, not a cleanup |
@@ -683,7 +734,36 @@ Full procedure, whether you use it as a pre-flight check (Route B) or as a stopg
 (Route C). It applies to either VM, but note the RAM ceiling below: this laptop can
 rehearse MyQ comfortably and `44.13` only in a cut-down form.
 
-### 2.0 Bench constraints
+### 2.0 Which machine is which
+
+> [!CAUTION]
+> **Two different computers are involved, and an earlier draft of this guide merged
+> them.** Everything in 2.0 and in Causes 2 and 3 of 2.7 was measured on the **laptop**.
+> The machine that was actually running VMware Workstation at `192.168.90.171` is the
+> **Dell T130**, which has a real NIC card. Read the table before trusting any
+> constraint below.
+
+| | **Infinix INBOOK X2 GEN11** (this laptop) | **Dell PowerEdge T130** |
+|---|---|---|
+| Role | Where the copier and these tools run | Where Workstation was run, and the ESXi 8 target |
+| RAM | **7.75 GB** - measured | 32 GB |
+| Address during the bridging attempts | not on the office LAN | **`192.168.90.171` / `255.255.252.0`, gw `192.168.89.1`** |
+| Ethernet | `Ethernet 2` = **TP-LINK Gigabit USB adapter**. No onboard PCIe NIC | **A real NIC card** |
+| Wi-Fi | Intel Wireless-AC 9461 | n/a |
+| VBS / HVCI | **running** - measured | not measured |
+
+**This matters for the diagnosis.** The bridging failure was analysed as "no bridgeable
+NIC", and that is true of the laptop and **false of the T130**. On a machine with a real
+NIC card, bridged mode has a proper adapter to bind to - so *Cause 2 does not apply to
+the machine the attempts were actually made on*, and the surviving explanations are
+**Cause 1** (the guests hold `172.17.44.x` on a `192.168.88.0/22` wire, which no
+bridging mode can fix) and **Cause 4** (the ghost NIC). Both are addressable. See 2.7.1
+for the test that separates them.
+
+The constraints below still apply if you rehearse on **the laptop**. If you are on the
+T130, use its own figures.
+
+### 2.0.1 Bench constraints (laptop only)
 
 | Constraint | Value | Consequence |
 |---|---|---|
@@ -805,7 +885,7 @@ play, and the first two are each fatal on their own.** None of them applies to t
 
 | | Address | Mask | Gateway |
 |---|---|---|---|
-| Bench laptop (office LAN) | `192.168.90.171` | `255.255.252.0` -> **/22** = `192.168.88.0 - 192.168.91.255` | `192.168.89.1` |
+| The T130 (office LAN) | `192.168.90.171` | `255.255.252.0` -> **/22** = `192.168.88.0 - 192.168.91.255` | `192.168.89.1` |
 | Either guest, as configured | `172.17.44.x` | `255.255.255.0` -> **/24** | `172.17.44.1` |
 
 Bridged mode puts the guest NIC directly onto the host's physical segment. MyQ boots,
@@ -830,7 +910,9 @@ flowchart TB
 
 No bridged/NAT/host-only permutation fixes a layer-3 mismatch.
 
-**Cause 2 - this laptop has no bridgeable NIC.** `Get-NetAdapterBinding -ComponentID
+**Cause 2 - the laptop has no bridgeable NIC** *(and this is the cause that turned out
+not to apply - the attempts were made on the T130, which has a real NIC card; see 2.0)*
+**.** `Get-NetAdapterBinding -ComponentID
 vmware_bridge` showed the bridge protocol bound to **everything**, which is why
 "Automatic" behaved unpredictably:
 
@@ -844,7 +926,8 @@ vmware_bridge` showed the bridge protocol bound to **everything**, which is why
 No onboard PCIe Ethernet. Bridging over Wi-Fi and bridging over a USB NIC are the two
 textbook cases where bridged mode fails.
 
-**Cause 3 - VBS forces ULM mode.** A speed penalty for MyQ rather than a blocker, since
+**Cause 3 - VBS forces ULM mode** *(measured on the laptop; not established for the
+T130)***.** A speed penalty for MyQ rather than a blocker, since
 it does not set `vhv.enable`. Turning VBS off means giving up WSL2, which the copier
 needs - so if you do it, do it **after** the copy finishes.
 
@@ -1114,7 +1197,10 @@ port forwarding, and the bench laptop's 7.7 GB cannot host 44.13 at 16 GB anyway
 which 44.13 requires; and **~191-204 GiB of free datastore**, including both `.vswp`
 files. Then build the quarantine portgroup before importing anything.
 
-**What are the sizings?** MyQ: `numvcpus = "2"`, `memSize` unchanged at `8192`,
-`coresPerSocket = "1"`. 44.13: `numvcpus = "4"` (down from 8), `memSize` unchanged at
-`16384`, `coresPerSocket = "4"`. Together that is 6 vCPU and 24 GB of guests against a
-4-core, 32 GB host - which fits, with about 2 GB of slack for ESXi beyond its ~6 GB.
+**What are the sizings?** MyQ: `numvcpus = "4"` (down from 8), `memSize = "16384"`
+(down from its production 24576), `coresPerSocket = "1"`. 44.13: `numvcpus = "4"` (down
+from 8), `memSize = "8192"` (down from 16384), `coresPerSocket = "4"`. Together that is
+8 vCPU and 24 GB of guests against a 4-core, 32 GB host. Neither machine fits alongside
+the other at its configured size - 24576 + 16384 is 40 GB - so MyQ, as the production
+application, keeps the larger share. Run either one alone and it can have its full size
+back; both trims are one line.

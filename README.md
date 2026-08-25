@@ -555,6 +555,16 @@ flowchart TD
 > booting in Workstation changes on disk, and why a guest keeping its old subnet
 > cannot be reached from a different one.
 
+> [!CAUTION]
+> **If a ransom note turns up on the recovered datastore, the restore changes shape.**
+> Copy and verify exactly as described above — a note does not stop the images being
+> readable — but the first power-on then belongs on a portgroup with **no uplink**,
+> before any scan and before any credential is reused. The note itself is evidence:
+> leave it on the read-only mount, and treat what it tells you to do as the attacker's
+> preference rather than advice. [MIGRATION.md](MIGRATION.md) opens with the full
+> procedure and the specific checks that distinguish "the boot structures survived"
+> from "the guests are clean."
+
 After the copy, each recovered folder should hold: the small text descriptor `VMName.vmdk`, the large `VMName-flat.vmdk`, `VMName.vmx`, `VMName.nvram`, maybe `.vmsd`. (The script excludes `*.vswp` swap and `*.log`; keep logs with `--keep-logs`, harmless, just not needed.)
 
 ```mermaid

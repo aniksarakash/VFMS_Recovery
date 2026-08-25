@@ -243,6 +243,12 @@ sudo mkdir -p /mnt/vmfs && sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs   # sdX drifts, r
 
 ### What a run looks like
 
+<div align="center">
+  <img src="docs/img/attach-run.png" alt="vmfs-attach.ps1 running elevated: the disk table marks the 932G GPT disk Windows reads as unreadable, and the usbipd table resolves busid 3-2 to disk 1 while 3-4 still holds disk 2 (D:)" width="100%" />
+  <br/>
+  <em>A real run. The boxed row is the VMFS disk — <strong>932G, 5 partitions, <code>unreadable</code></strong> — and busid <code>3-2</code> is the enclosure holding it. <code>3-4</code> holds <code>disk 2 (D:)</code>, the copy destination; attaching that one to WSL would have pulled the destination out from under the copy.</em>
+</div>
+
 Illustrative output, showing the two-enclosure case that makes manual attaching risky:
 
 ```text
@@ -323,6 +329,12 @@ Run it a second time (to add `-Mount` to an attach that already happened, say) a
 [`vmfs-copy.sh`](vmfs-copy.sh) is the heart of this repo, one interactive tool that **detects** every VM folder, lets you **select** which to pull, and copies each with the **right engine per file** and a **live progress bar**. It's built to be re-run: `ddrescue` mapfiles mean an interrupted copy **resumes**, it never restarts a disk image from zero.
 
 ### What a run looks like
+
+<div align="center">
+  <img src="docs/img/copier-detect-and-copy.png" alt="vmfs-copy.sh detection table listing five VM folders with a DEST column reading complete, absent, absent, partial 99% and empty, then ddrescue copying the selected 90.2G flat vmdk at 15269 kB/s with bad:0" width="100%" />
+  <br/>
+  <em>Detection, selection, space check, copy — one pass. The boxed <strong>DEST</strong> column is the whole point of re-running: <code>complete</code> is done, <code>absent</code> has never been touched, <code>partial 99%</code> resumes from the mapfile.</em>
+</div>
 
 ```text
   VMFS recovery copier
@@ -547,6 +559,12 @@ flowchart TD
     classDef ok  fill:#0f3d2e,stroke:#2ea44f,color:#fff;
     class B,E,J win; class F,G,H,L,N nix; class O ok;
 ```
+
+<div align="center">
+  <img src="docs/img/copier-resume-throughput.png" alt="A re-run of vmfs-copy.sh after an interrupted session: the summary shows the previous VM complete, two stale mapfiles are ignored because the destination file holds 0B, and ddrescue is at 43.92% with bad:0 while Task Manager shows the destination USB disk writing at 9.5 MB/s" width="100%" />
+  <br/>
+  <em>A re-run after an interrupted session, with the destination drive's own counters beside it. The previous VM is already <code>complete</code>; the two <code>Stale mapfile ignored</code> lines are the guard described in the <a href="#i-deleted-the-recovered-files-but-kept-the-ddrescue-mapfile-will-a-re-run-notice">FAQ</a> refusing to trust a mapfile that claims 90.0G against a 0B file, so this copy correctly starts from zero rather than reporting a finished image in a second.</em>
+</div>
 
 > [!NOTE]
 > **Why resuming is safe.** `ddrescue` reads its mapfile and only re-attacks sectors not already marked rescued; `rsync` only re-sends files that are missing or changed. Neither restarts from zero. What breaks in a crash isn't the recovery logic; it's the layers underneath (WSL's VM state, the drvfs bridge, the USB attachment, enclosure power) that need re-establishing.

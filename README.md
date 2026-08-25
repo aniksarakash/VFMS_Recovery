@@ -956,6 +956,23 @@ sudo ./vmfs-copy.sh [options]
 > [!NOTE]
 > **Common flag combos.** `--all --yes` = unattended full pull. `--dry-run` = see the plan, touch nothing. `--big-mb 512` = treat 512 MB+ images as `ddrescue` candidates. `--no-ddrescue` = healthy drive, want speed over bad-sector resilience.
 
+### `verify-staged.sh` (WSL)
+
+```text
+./verify-staged.sh [--dest /mnt/d] [--src /mnt/vmfs] [--ram 8192] [--vcpu 4]
+```
+
+Read-only pre-flight on what the copier produced, run **before** you import anything. It answers the question the copier can't: *is this actually importable?*
+
+- 📏 **Image completeness**, exact byte size against the descriptor's extent, plus `# Finished` and `bad areas: 0` from the ddrescue mapfile and log.
+- 🧬 **Boot structures survived**, checks the protective MBR signature and the `EFI PART` GPT header **on the destination copy**, not the source — that's the difference between "ddrescue reported success" and "the image will boot".
+- 🧾 **vmx sanity**, no duplicate keys, LF endings, every line parsing as `key = "value"`.
+- 🧹 **Dead-host keys gone**, `numa.autosize.*`, `migrate.hostLog`, `sched.swap.derivedName`, and any surviving absolute `/vmfs/volumes/` path.
+- ⚙️ **The rule that stops power-on**, asserts `cpuid.coresPerSocket` divides evenly into `numvcpus`, and totals guest RAM against the host budget.
+- 🗄 **Backups kept**, confirms an untouched original still sits beside every edited file, and diffs it against the live mount where both are available.
+
+Safe to run while a copy is still in progress — an unfinished image is a warning, not a failure. Exits non-zero if anything fails, so it works as a gate in front of `ovftool`.
+
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
 ## 🗒 Field Notes

@@ -11,10 +11,12 @@ Everything below is sized for both.
 
 > [!IMPORTANT]
 > Every figure in the first four sections was **re-read from the live mount on
-> 25 Aug 2026** and several were corrected. An earlier draft of this guide described a
-> different capture of this datastore - a different set of folders, and MyQ at 8 vCPU /
-> 24576 MB, which is not what its vmx says here. If you are working from a printout,
-> discard it. Parts 2 and 3 (VMware Workstation) were unaffected.
+> 25 Aug 2026** and several were corrected. An earlier draft described a different
+> capture of this datastore, with a different set of folders. Its **sizing** figures -
+> MyQ at 8 vCPU / 24576 MB - turned out to be right, because they came from MyQ's
+> production vmx; its **folder list** did not. If you are working from a printout,
+> discard it. Parts 2 and 3 (VMware Workstation) were unaffected except for which
+> machine they describe - see 2.0.
 
 ---
 
@@ -183,8 +185,8 @@ regardless of how little was allocated on the source.
 | Archive **both** VMs off the VMFS volume | **180 GiB** (90 + 90) |
 | Add a persistent working copy of one VM for a Workstation boot | **+90 GiB** |
 | Workstation test with a **non-persistent** disk | **no extra space at all** |
-| T130 datastore, thick, at the memory sizes above | **~204 GiB** (180 disk + 8 + 16 GiB `.vswp`) |
-| T130 datastore, `--diskMode=thin` | **~191 GiB** at worst (77 + 90 allocated + 24 `.vswp`); less if the guests' free space is zeroed |
+| T130 datastore, thick, at 8 GB RAM per VM | **~196 GiB** (180 disk + 8 + 8 GiB `.vswp`) |
+| T130 datastore, `--diskMode=thin` | **~183 GiB** at worst (77 + 90 allocated + 16 `.vswp`); less if the guests' free space is zeroed |
 
 > [!WARNING]
 > **`--diskMode=thin` saves much less here than it looks.** MyQ is 77.03 GiB allocated
@@ -270,6 +272,20 @@ transfer step between the two** - `/mnt/d/44.13_CMS_Ticketing_System` and
 `D:\44.13_CMS_Ticketing_System` are the same directory.
 
 ### 0.2 Verify before you build anything on it
+
+**`./verify-staged.sh` runs every check in this section and the rest of Part 0**, plus
+the vmx checks from 1.5 and the power-on rule from 1.1. It is read-only and safe to run
+while a copy is still in progress - an unfinished image is a warning, not a failure.
+
+```sh
+./verify-staged.sh                  # both VMs, defaults: /mnt/vmfs -> /mnt/d, 8192 MB, 4 vCPU
+./verify-staged.sh --ram 16384      # if you have raised a VM's memSize
+./verify-staged.sh --dest /mnt/e    # destination other than D:
+```
+
+It exits non-zero if anything fails, so it works as a gate in front of the transfer.
+The individual checks are below, for when you want to run one by hand or understand
+what the script is asserting.
 
 Run all four. The first two come from the copier's own output; the last two are cheap
 and catch a truncated or mismatched image before it costs you a boot.
@@ -425,28 +441,27 @@ host reports 4 threads and they are.
 
 Reserve roughly **6 GB** for ESXi 8 and its agents, leaving ~26 GB for guests.
 
-**Neither machine's configured size fits alongside the other.** MyQ is configured for
-24576 and 44.13 for 16384 - 40 GB against a ~26 GB budget. Something has to give, and
-MyQ is the production application, so it keeps the larger share:
+**The T130 has 32 GB, and the cap is 8192 MB per VM.** Neither machine's configured
+size is anywhere near that - MyQ is set to 24576 and 44.13 to 16384, which is 40 GB
+between them - so both come down:
 
 | VM | Configured | **Use** | Guest | `.vswp` on datastore |
 |---|---|---|---|---|
-| MyQ | 24576 | **16384** | 16 GB | 16 GiB |
+| MyQ | 24576 | **8192** | 8 GB | 8 GiB |
 | 44.13 | 16384 | **8192** | 8 GB | 8 GiB |
-| **Total** | 40 GB - too much | | **24 GB** | **24 GiB** |
+| **Total** | 40 GB - far too much | | **16 GB** | **16 GiB** |
 
-24 GB of guests against ~26 GB available fits and leaves about 2 GB of slack.
+16 GB of guests on a 32 GB host leaves **16 GB for ESXi and headroom** - roughly 6 GB
+for the hypervisor and its agents, and ~10 GB spare. That is a comfortable host rather
+than a tight one, and it leaves room to raise one VM later without re-planning the whole
+budget.
 
-Both trims are one line, and both are reversible the moment the other VM is not running:
-
-| If you run... | You can give it |
-|---|---|
-| **MyQ alone** | `memSize = "24576"` - its full production size. ~7 GB left for ESXi, which is tight but workable |
-| **44.13 alone** | `memSize = "16384"` - its own configured size |
-| **Both** | The 16384 / 8192 split above |
-
-Start with the split. Raise MyQ later if the application actually needs it - that is a
-one-line vmx change and a reboot, whereas a starved host is harder to diagnose.
+> [!NOTE]
+> **8192 is a deliberate ceiling, not an arithmetic result.** Two VMs at 8 GB fit a
+> 32 GB host with room to spare; you could fit more. Holding the line at 8 GB each keeps
+> the host uncontended and the swap files small, and both figures are one vmx line if a
+> workload turns out to genuinely need more. Raise it after you have watched the machine
+> run, not before - a starved host is much harder to diagnose than a slow application.
 
 ### 1.3 Storage budget - do not forget the swap files
 
@@ -457,13 +472,13 @@ is real datastore space, on top of the disks.
 |---|---|---|
 | MyQ disk | 90 GiB | ~77 GiB |
 | 44.13 disk | 90 GiB | ~90 GiB (fully allocated on the source) |
-| MyQ `.vswp` at 16 GB | 16 GiB | 16 GiB |
+| MyQ `.vswp` at 8 GB | 8 GiB | 8 GiB |
 | 44.13 `.vswp` at 8 GB | 8 GiB | 8 GiB |
-| **Total free needed** | **~204 GiB** | **~191 GiB** |
+| **Total free needed** | **~196 GiB** | **~183 GiB** |
 
-If you give MyQ its full 24576 and run it alone, the requirement is **~114 GiB** thick
-or **~101 GiB** thin - the swap file grows with `memSize`, so it moves with every change
-you make above.
+Capping RAM at 8 GB per VM takes ~8 GiB off the datastore requirement compared with
+leaving 44.13 at its configured 16384. The swap file tracks `memSize` exactly, so any
+later RAM change moves this number with it.
 
 ```sh
 df -h /vmfs/volumes/datastore1
@@ -601,7 +616,7 @@ What changed, and why:
 | `sata0:0.fileName` -> `"auto detect"` | yes | yes | as above |
 | `sata0:0.startConnected` -> `"FALSE"` | added | **changed from `TRUE`** | On 44.13 this is the difference between a clean power-on and an error about a missing ISO |
 | `numvcpus` | `8` -> **`4`** | `8` -> **`4`** | 1.1 |
-| `memSize` | `24576` -> **`16384`** | `16384` -> **`8192`** | 1.2 - neither fits alongside the other at its configured size |
+| `memSize` | `24576` -> **`8192`** | `16384` -> **`8192`** | 1.2 - 8192 is the per-VM cap on a 32 GB host |
 | `cpuid.coresPerSocket` | unchanged at `1` | unchanged at `4` | Both divide evenly into the new `numvcpus` |
 | `numa.autosize.cookie` | **deleted** | **deleted** | Baked to the dead host's topology; ESXi regenerates it |
 | `numa.autosize.vcpu.maxPerVirtualNode` | **deleted** | **deleted** | as above |
@@ -618,7 +633,7 @@ sata0:0.startConnected = "FALSE"
 
 # --- right-size for a 4-core / 32 GB host (see 1.1 and 1.2) ---
 numvcpus             = "4"      # both VMs, down from 8
-memSize              = "16384"  # MyQ, down from 24576  - 44.13 gets "8192", down from 16384
+memSize              = "8192"   # both VMs - down from 24576 (MyQ) and 16384 (44.13)
 cpuid.coresPerSocket = "1"      # MyQ    - 44.13 keeps "4"
 
 # --- delete outright: all four are baked to the dead host ---
@@ -767,7 +782,7 @@ T130, use its own figures.
 
 | Constraint | Value | Consequence |
 |---|---|---|
-| Host RAM | **7.7 GB** - measured | Give whichever VM you are testing **4096 MB** and 2 vCPU here. MyQ's own 8192 is already too much, and 44.13's 16384 is not close |
+| Host RAM | **7.7 GB** - measured | Give whichever VM you are testing **4096 MB** and 2 vCPU here. Nothing else fits: MyQ is configured for 24576, 44.13 for 16384, and even the 8192 they get on the T130 is more than this laptop can spare |
 | VBS / HVCI | **running** - measured (`VirtualizationBasedSecurityStatus : 2`) | Workstation drops to **ULM mode**: slower guests. MyQ does not set `vhv.enable`, so it only pays a speed penalty. **44.13 does**, along with `vvtd.enable` and `windows.vbs.enabled` - nested virtualisation under ULM is unreliable, so bench 44.13 with all three set to `FALSE` |
 | Free space | **~118 GiB** once both archives land on `D:` | Room for **one** persistent working copy, not two |
 | Disk media | check with `Get-PhysicalDisk` | On a SATA SSD, boot and chkdsk run at normal speed. On a USB hard disk, 4K random I/O is around 1 MB/s and a chkdsk pass over 90 GB can run for hours |
@@ -1094,7 +1109,7 @@ flowchart TD
 3. **Keep the archive pristine**, and make sure each folder's metadata came off the same
    read as its image (0.3).
 4. **Verify the T130** - `esxcli hardware cpu global get`, VT-x/EPT in the BIOS for
-   44.13, and `df -h` against the ~191-204 GiB requirement.
+   44.13, and `df -h` against the ~183-196 GiB requirement.
 5. **Build the quarantine portgroup** on a vSwitch with no uplink (1.4).
 6. **Optional bench boot** (Route B) - non-persistent disk, **"I Moved It"**, decline
    the HW upgrade, NAT.
@@ -1194,13 +1209,13 @@ port forwarding, and the bench laptop's 7.7 GB cannot host 44.13 at 16 GB anyway
 
 **What must you check before power-on?** The T130's **thread count**
 (`esxcli hardware cpu global get`); whether the BIOS **exposes VT-x/EPT to guests**,
-which 44.13 requires; and **~191-204 GiB of free datastore**, including both `.vswp`
+which 44.13 requires; and **~183-196 GiB of free datastore**, including both `.vswp`
 files. Then build the quarantine portgroup before importing anything.
 
-**What are the sizings?** MyQ: `numvcpus = "4"` (down from 8), `memSize = "16384"`
-(down from its production 24576), `coresPerSocket = "1"`. 44.13: `numvcpus = "4"` (down
-from 8), `memSize = "8192"` (down from 16384), `coresPerSocket = "4"`. Together that is
-8 vCPU and 24 GB of guests against a 4-core, 32 GB host. Neither machine fits alongside
-the other at its configured size - 24576 + 16384 is 40 GB - so MyQ, as the production
-application, keeps the larger share. Run either one alone and it can have its full size
-back; both trims are one line.
+**What are the sizings?** Both VMs: `numvcpus = "4"` (down from 8) and
+`memSize = "8192"` - **8 GB per VM is the cap on this 32 GB host.** MyQ keeps
+`coresPerSocket = "1"`, 44.13 keeps `"4"`; both divide evenly into 4, which power-on
+requires. That is 8 vCPU and 16 GB of guests against a 4-core, 32 GB host, leaving
+16 GB for ESXi and headroom. Their configured sizes were 24576 and 16384 - 40 GB
+between them - so both came down substantially. Raise one later if you watch it run and
+it genuinely needs more; it is a single vmx line and a reboot.

@@ -278,10 +278,16 @@ the vmx checks from 1.5 and the power-on rule from 1.1. It is read-only and safe
 while a copy is still in progress - an unfinished image is a warning, not a failure.
 
 ```sh
-./verify-staged.sh                  # both VMs, defaults: /mnt/vmfs -> /mnt/d, 8192 MB, 4 vCPU
-./verify-staged.sh --ram 16384      # if you have raised a VM's memSize
-./verify-staged.sh --dest /mnt/e    # destination other than D:
+./verify-staged.sh --ram 8192 --vcpu 4   # the T130 budget: check every VM against it
+./verify-staged.sh --ram 16384           # if you have raised a VM's memSize
+./verify-staged.sh --dest /mnt/e         # destination other than D:
+./verify-staged.sh                       # report the sizing, do not judge it
 ```
+
+Pass `--ram` and `--vcpu` here. Without them the script reports each VM's `memSize` and
+`numvcpus` instead of holding them to a number, which is right for a stranger's datastore
+and wrong for this migration: the whole point of Part 1 is that these two guests are
+capped at 8 GB and 4 vCPU each so they fit the T130's 32 GB alongside ESXi itself.
 
 It exits non-zero if anything fails, so it works as a gate in front of the transfer.
 The individual checks are below, for when you want to run one by hand or understand

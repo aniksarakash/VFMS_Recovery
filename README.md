@@ -57,7 +57,7 @@
 
 ## 📌 What This Repository Is
 
-**VMFS Recovery** is a field-tested playbook plus two scripts, [`vmfs-attach.ps1`](vmfs-attach.ps1) for the Windows half and [`vmfs-copy.sh`](vmfs-copy.sh) for the Linux half, for **recovering VMware virtual machines from a bare VMFS6 datastore disk**: a drive that has been physically pulled out of an ESXi host and plugged into a Windows PC through a USB enclosure.
+**VMFS Recovery** is a field-tested playbook plus three scripts, [`vmfs-attach.ps1`](vmfs-attach.ps1) for the Windows half, [`vmfs-copy.sh`](vmfs-copy.sh) for the Linux half, and [`verify-staged.sh`](verify-staged.sh) to check the result before you import it, for **recovering VMware virtual machines from a bare VMFS6 datastore disk**: a drive that has been physically pulled out of an ESXi host and plugged into a Windows PC through a USB enclosure.
 
 **The problem.** Windows cannot read VMFS. There is no native Windows VMFS driver, so the disk shows up in Disk Management as a healthy partition with no drive letter, no recognized filesystem, and an offer to format it. Nothing on it is damaged. Windows simply doesn't speak the filesystem.
 
@@ -140,10 +140,11 @@ The drive is **no longer in an ESXi host**. It's out, in an enclosure, plugged i
 | **`vmfs6-fuse`** | WSL2 | FUSE driver to mount a VMFS6 volume | via `vmfs6-tools`, package manager first, else build from source |
 | **`gddrescue`** (→ `ddrescue`) | WSL2 | Sector-level recovery for a degrading drive | `sudo apt install gddrescue` |
 | **`rsync`** | WSL2 | Bulk copy for everything that isn't a giant image | usually preinstalled · else `sudo apt install rsync` |
+| **`xxd`** | WSL2 | Reads the MBR signature back off the copy in [`verify-staged.sh`](verify-staged.sh) | usually preinstalled · else `sudo apt install xxd` |
 | **PowerShell** (admin) | Windows | Runs [`vmfs-attach.ps1`](vmfs-attach.ps1); `diskpart` and `usbipd` both need elevation | preinstalled · Windows PowerShell 5.1 or PowerShell 7+ |
 
 > [!TIP]
-> **Known-good enclosure fingerprint for this workflow: `0bda:9210`** (Realtek UAS bridge). A different VID:PID claiming to be mass storage (a `152d:0583` or `0bda:9201` decoy has shown up before) **is not it.** Always confirm the VID:PID in `usbipd list` before attaching.
+> **Known-good enclosure fingerprint for this workflow: `0bda:9210`** (Realtek UAS bridge). A different VID:PID claiming to be mass storage **is not it**, and the near-miss is not always an unrelated device. In the [attach-script screenshot](#-the-attach-script-windows), `0bda:9201` one busid over is the enclosure holding the **destination** drive `D:`; attaching that one hands your copy target to WSL and takes it away from Windows. `152d:0583` has turned up on this bench too. Always confirm the VID:PID in `usbipd list` before attaching, and prefer the script, whose `HOLDS` column resolves each bridge to the disk behind it.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
@@ -246,7 +247,7 @@ sudo mkdir -p /mnt/vmfs && sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs   # sdX drifts, r
 <div align="center">
   <img src="docs/img/attach-run.png" alt="vmfs-attach.ps1 running elevated: the disk table marks the 932G GPT disk Windows reads as unreadable, and the usbipd table resolves busid 3-2 to disk 1 while 3-4 still holds disk 2 (D:)" width="100%" />
   <br/>
-  <em>A real run. The boxed row is the VMFS disk — <strong>932G, 5 partitions, <code>unreadable</code></strong> — and busid <code>3-2</code> is the enclosure holding it. <code>3-4</code> holds <code>disk 2 (D:)</code>, the copy destination; attaching that one to WSL would have pulled the destination out from under the copy.</em>
+  <em>A real run. The boxed row is the VMFS disk (<strong>932G, 5 partitions, <code>unreadable</code></strong>), and busid <code>3-2</code> is the enclosure holding it. <code>3-4</code> holds <code>disk 2 (D:)</code>, the copy destination; attaching that one to WSL would have pulled the destination out from under the copy.</em>
 </div>
 
 Illustrative output, showing the two-enclosure case that makes manual attaching risky:
@@ -333,7 +334,7 @@ Run it a second time (to add `-Mount` to an attach that already happened, say) a
 <div align="center">
   <img src="docs/img/copier-detect-and-copy.png" alt="vmfs-copy.sh detection table listing five VM folders with a DEST column reading complete, absent, absent, partial 99% and empty, then ddrescue copying the selected 90.2G flat vmdk at 15269 kB/s with bad:0" width="100%" />
   <br/>
-  <em>Detection, selection, space check, copy — one pass. The boxed <strong>DEST</strong> column is the whole point of re-running: <code>complete</code> is done, <code>absent</code> has never been touched, <code>partial 99%</code> resumes from the mapfile.</em>
+  <em>Detection, selection, space check, copy, all in one pass. The boxed <strong>DEST</strong> column is the whole point of re-running: <code>complete</code> is done, <code>absent</code> has never been touched, <code>partial 99%</code> resumes from the mapfile.</em>
 </div>
 
 ```text
@@ -580,15 +581,15 @@ flowchart TD
 
 > [!TIP]
 > Moving to **different** hardware, or hit a networking wall trying to bench the VMs
-> in VMware Workstation first? See **[MIGRATION.md](MIGRATION.md)** — it covers vCPU
+> in VMware Workstation first? See **[MIGRATION.md](MIGRATION.md)**. It covers vCPU
 > and RAM budgeting for a smaller host, the `.vswp` space nobody accounts for, what
 > booting in Workstation changes on disk, and why a guest keeping its old subnet
 > cannot be reached from a different one.
 
 > [!CAUTION]
 > **If a ransom note turns up on the recovered datastore, the restore changes shape.**
-> Copy and verify exactly as described above — a note does not stop the images being
-> readable — but the first power-on then belongs on a portgroup with **no uplink**,
+> Copy and verify exactly as described above, since a note does not stop the images
+> being readable, but the first power-on then belongs on a portgroup with **no uplink**,
 > before any scan and before any credential is reused. The note itself is evidence:
 > leave it on the read-only mount, and treat what it tells you to do as the attacker's
 > preference rather than advice. [MIGRATION.md](MIGRATION.md) opens with the full
@@ -638,7 +639,7 @@ vim-cmd vmsvc/getallvms
 vim-cmd vmsvc/power.on <Vmid>
 ```
 
-- Asked **copied vs moved**? Choose **"I copied it"** unless it's a guaranteed 1:1 replacement; "copied" issues a fresh UUID/MAC and avoids conflicts. **If the original host is dead and will never run again, that caveat applies to you: pick "I moved it".** It preserves `uuid.bios` (so Windows activation survives) and the original MAC — and a changed MAC makes Windows enumerate a *new* NIC, stranding the guest's static IP on a hidden device that no longer exists. That is the usual reason a restored server comes up with no address.
+- Asked **copied vs moved**? Choose **"I copied it"** unless it's a guaranteed 1:1 replacement; "copied" issues a fresh UUID/MAC and avoids conflicts. **If the original host is dead and will never run again, that caveat applies to you: pick "I moved it".** It preserves `uuid.bios` (so Windows activation survives) and the original MAC. A changed MAC makes Windows enumerate a *new* NIC, stranding the guest's static IP on a hidden device that no longer exists. That is the usual reason a restored server comes up with no address.
 - The NIC will likely show disconnected (the old portgroup doesn't exist here); fix under VM Settings → Network Adapter.
 - A hardware-compatibility complaint → use **Upgrade VM Compatibility**, don't rebuild.
 
@@ -740,9 +741,9 @@ udevadm info --query=property --name=/dev/sdX | grep -E 'ID_MODEL|ID_SERIAL_SHOR
 # ID_REVISION=EGFM11.3
 ```
 
-`lsblk`'s `MODEL`, `SERIAL` and `REV` columns come from the udev database, and udev is still processing the device for a moment after the block node appears — which is exactly when a script that polls for `/dev/sdX` asks. Win the race and you get `Force MP600 202882290001285556AE EGFM11.3`; lose it and you get `600 1.00`. Same drive, same enclosure, different answer.
+`lsblk`'s `MODEL`, `SERIAL` and `REV` columns come from the udev database, and udev is still processing the device for a moment after the block node appears, which is exactly when a script that polls for `/dev/sdX` asks. Win the race and you get `Force MP600 202882290001285556AE EGFM11.3`; lose it and you get `600 1.00`. Same drive, same enclosure, different answer.
 
-**Fix:** a current `vmfs-attach.ps1` runs `udevadm settle` first, takes udev's answer, and only falls back to the raw fields if it never arrives — rejoining the halves when the vendor field is full at all 8 bytes, because that is what a split looks like. It also prints the enclosure on its own line, since `ID_USB_SERIAL_SHORT` is the **bridge's** serial and stays the same when you swap the drive inside it:
+**Fix:** a current `vmfs-attach.ps1` runs `udevadm settle` first, takes udev's answer, and only falls back to the raw fields if it never arrives, rejoining the halves when the vendor field is full at all 8 bytes, because that is what a split looks like. It also prints the enclosure on its own line, since `ID_USB_SERIAL_SHORT` is the **bridge's** serial and stays the same when you swap the drive inside it:
 
 ```
   Drive: Force MP600  serial 202882290001285556AE  fw EGFM11.3
@@ -989,19 +990,20 @@ sudo ./vmfs-copy.sh [options]
 ### `verify-staged.sh` (WSL)
 
 ```text
-./verify-staged.sh [--dest /mnt/d] [--src /mnt/vmfs] [--ram 8192] [--vcpu 4]
+./verify-staged.sh [--dest /mnt/d] [--src /mnt/vmfs] [--ram 8192] [--vcpu 4] [--host-ram 32768]
 ```
 
-Read-only pre-flight on what the copier produced, run **before** you import anything. It answers the question the copier can't: *is this actually importable?*
+Read-only pre-flight on what the copier produced, run **before** you import anything. It answers the question the copier can't: *is this actually importable?* Every folder holding a `-flat.vmdk` is checked, whatever its size.
 
-- 📏 **Image completeness**, exact byte size against the descriptor's extent, plus `# Finished` and `bad areas: 0` from the ddrescue mapfile and log.
-- 🧬 **Boot structures survived**, checks the protective MBR signature and the `EFI PART` GPT header **on the destination copy**, not the source — that's the difference between "ddrescue reported success" and "the image will boot".
+- 📏 **Image completeness**, exact byte size against **that VM's own descriptor extent**, so a 90 GiB image and a 256 GiB one are each measured against what their own `RW <sectors> VMFS` line declares. Plus `# Finished` and `bad areas: 0` from the ddrescue mapfile and log.
+- 🧬 **Boot structures survived**, checks the protective MBR signature and the `EFI PART` GPT header **on the destination copy**, not the source. That is the difference between "ddrescue reported success" and "the image will boot".
 - 🧾 **vmx sanity**, no duplicate keys, LF endings, every line parsing as `key = "value"`.
-- 🧹 **Dead-host keys gone**, `numa.autosize.*`, `migrate.hostLog`, `sched.swap.derivedName`, and any surviving absolute `/vmfs/volumes/` path.
-- ⚙️ **The rule that stops power-on**, asserts `cpuid.coresPerSocket` divides evenly into `numvcpus`, and totals guest RAM against the host budget.
+- 🧹 **Dead-host keys gone**, `numa.autosize.*`, `migrate.hostLog`, `sched.swap.derivedName`, and any surviving absolute `/vmfs/volumes/` path. The CD-ROM check finds whichever device declares itself an `atapi-cdrom`, on `sata`, `ide`, or `scsi`, and passes a VM that has no CD-ROM at all.
+- ⚙️ **The rule that stops power-on**, asserts `cpuid.coresPerSocket` divides evenly into `numvcpus`, and totals guest RAM against `--host-ram` (default 32768 MB) less the ~6 GB ESXi keeps for itself.
+- 🔒 **Sizing you asked for, not sizing it assumed**, `--ram` and `--vcpu` are enforced only when you pass them. Left off, the values are reported rather than judged, because there is no generally correct `memSize` for someone else's VM.
 - 🗄 **Backups kept**, confirms an untouched original still sits beside every edited file, and diffs it against the live mount where both are available.
 
-Safe to run while a copy is still in progress — an unfinished image is a warning, not a failure. Exits non-zero if anything fails, so it works as a gate in front of `ovftool`.
+Safe to run while a copy is still in progress. An unfinished image is a warning, not a failure, and that extends to the boot structures: a missing MBR on a half-written image is reported as "recheck at the end", and only counts against a copy that has reached its declared size. Exits non-zero if anything fails, so it works as a gate in front of `ovftool`.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
@@ -1011,7 +1013,7 @@ Safe to run while a copy is still in progress — an unfinished image is a warni
 - **Busid numbers, `/dev/sdX` letters, drive letters, and folder names will all differ next time.** Only the *shape* of the process stays the same, that's what the diagrams and the script are for.
 - **Known-good enclosure:** `0bda:9210` (Realtek UAS bridge). It's shown power sensitivity under concurrent multi-stream I/O, run one copy operation at a time against it. The script does this by default.
 - **`bad areas: 0` is the number that matters.** A size match is a good sign; a clean `ddrescue` summary is the proof.
-- **Last verified: 24 August 2026**. Windows 11 Pro (build 26200), WSL2 Ubuntu, GNU `ddrescue` 1.27, against a 931 GB VMFS6 volume in a Realtek `0bda:9210` enclosure.
+- **Last verified: 25 August 2026**. Windows 11 Pro (build 26200), WSL2 Ubuntu, GNU `ddrescue` 1.27, against a 931 GB VMFS6 volume in a Realtek `0bda:9210` enclosure.
 - **Machine-readable summaries live alongside this README**, [`llms.txt`](llms.txt) for LLMs and answer engines, [`CITATION.cff`](CITATION.cff) if you need to cite this.
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />

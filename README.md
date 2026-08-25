@@ -86,6 +86,7 @@
 - [⚡ Quick Start](#-quick-start)
 - [🪟 The Attach Script (Windows)](#-the-attach-script-windows)
 - [🖥 The Copier Script](#-the-copier-script)
+- [✅ The Verifier Script](#verify-stagedsh-wsl)
 - [📖 Full Walkthrough](#-full-walkthrough)
 
 </td>
@@ -165,9 +166,11 @@ flowchart TD
     L -- Yes --> M["🩺 ddrescue the -flat.vmdk<br/>(sector-level, resumable)"]
     L -- No --> N["📄 rsync the folder<br/>(minus .vswp / .log)"]
     M --> N2["📄 rsync the rest"]
-    N --> O["✅ Verify: bad areas 0,<br/>size matches source"]
+    N --> O["✅ ./verify-staged.sh<br/>bad areas 0 · exact size ·<br/>EFI PART readable on the copy"]
     N2 --> O
-    O --> P(["🚀 ESXi 8 restore"])
+    O --> O2{"Any<br/>failures?"}
+    O2 -- Yes --> O3["🛠 Fix before importing,<br/>a bad image boots once"] --> O
+    O2 -- No --> P(["🚀 ESXi 8 restore"])
 
     classDef win fill:#0F2027,stroke:#0078D6,color:#fff;
     classDef nix fill:#1b2b34,stroke:#39BAE6,color:#fff;
@@ -183,7 +186,7 @@ flowchart TD
 
 ## ⚡ Quick Start
 
-Two scripts, two shells. The Windows one attaches the disk, the Linux one copies the files.
+Three scripts, two shells. The Windows one attaches the disk; the Linux ones copy the files and then check that what landed is actually importable.
 
 **1. Windows, in an administrator PowerShell.** Offlines the disk, hands the enclosure to WSL2, mounts the datastore:
 
@@ -202,7 +205,16 @@ sudo ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
 
 `sudo` is not optional here. `vmfs6-fuse` owns the mount as root and does not pass `allow_other`, so to any other user *every* path under `/mnt/vmfs` fails with `EACCES`. Run the copier as yourself and it cannot read one byte of the datastore; it now says so and hands you the `sudo` line rather than claiming the source is missing.
 
-**3. When the copy is finished**, unwind cleanly from Windows:
+**3. Before you trust it**, check that what landed is importable. Read-only, and safe to run while a copy is still going:
+
+```bash
+chmod +x verify-staged.sh
+./verify-staged.sh --dest /mnt/d
+```
+
+`bad areas: 0` means the *copy* was clean; it says nothing about whether the image still has a readable partition table at the other end. This reads sector 0 and 1 back **off the destination** and exits non-zero if anything fails, so you find out now rather than at power-on.
+
+**4. When the copy is finished**, unwind cleanly from Windows:
 
 ```powershell
 .\vmfs-attach.ps1 -Detach

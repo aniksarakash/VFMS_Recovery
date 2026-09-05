@@ -2,17 +2,23 @@
 # vmfs-attach.ps1 - Windows-side companion to vmfs-copy.sh
 #
 # Does the three things vmfs-copy.sh structurally cannot, because it runs on
-# Windows: takes the VMFS disk offline so Windows releases it, hands the USB
-# enclosure to WSL2 with usbipd, then optionally mounts the datastore with
-# vmfs6-fuse and prints the exact copier command to run next.
+# Windows: detects plugged-in USB/Type-C NVMe/SATA enclosures, takes the VMFS
+# disk offline so Windows releases it (or confirms raw media needs no offlining),
+# hands the USB enclosure to WSL2 with usbipd (auto-binding if unshared), then
+# optionally mounts the datastore with vmfs6-fuse, displays a rich command-line
+# visual inspection of datastore contents & sizes, and prints the exact copier
+# command to run next.
 #
-# Detects candidate disks and enclosures, lets you pick, and waits with a live
-# clock instead of asking you to guess how long an attach takes.
+# Detects candidate disks and enclosures across MSFT_Disk, Win32_DiskDrive (WMI),
+# Get-PnpDevice (PnP), and usbipd. Supports enclosures in UAS, USB Mass Storage,
+# and raw/unloaded media states (such as Realtek RTL9210 and ASMedia bridges).
 #
 #   .\vmfs-attach.ps1                      # detect + interactive, offline + attach
 #   .\vmfs-attach.ps1 -Mount               # also mount VMFS6 inside WSL
-#   .\vmfs-attach.ps1 -BusId 3-2 -Mount -Yes
-#   .\vmfs-attach.ps1 -DiskNumber 2 -Mount
+#   .\vmfs-attach.ps1 -Mount -Inspect      # mount + select & view contents with visual effects
+#   .\vmfs-attach.ps1 -Inspect             # select and view datastore contents & VM details
+#   .\vmfs-attach.ps1 -BusId 1-7 -Mount -Yes
+#   .\vmfs-attach.ps1 -DiskNumber 1 -Mount
 #   .\vmfs-attach.ps1 -DryRun              # show the plan, change nothing
 #   .\vmfs-attach.ps1 -Detach              # reverse it: unmount, detach, online
 #
@@ -22,13 +28,16 @@
 #===============================================================================
 [CmdletBinding()]
 param(
-  [string] $BusId,                      # e.g. 3-2; skips enclosure detection
+  [string] $BusId,                      # e.g. 1-7; skips enclosure detection
   [int]    $DiskNumber = -1,            # Windows disk number; skips disk detection
   [string] $Distro,                     # WSL distro; default is your default distro
   [string] $Src  = '/mnt/vmfs',         # where to mount the datastore inside WSL
   [string] $Dest = '/mnt/d',            # destination drive, used in the closing hint
   [switch] $Mount,                      # also run vmfs6-fuse
   [switch] $Detach,                     # undo: unmount, usbipd detach, online disk
+  [Alias('View', 'Tree', 'Browse')]
+  [switch] $Inspect,                    # select and view contents and sizes with visual effects
+  [string] $SelectVm,                   # target a specific VM folder for detailed inspection
   [switch] $Yes,                        # no prompts
   [switch] $DryRun,                     # print actions, execute none
   [int]    $TimeoutSec = 90
@@ -41,13 +50,10 @@ $ErrorActionPreference = 'Continue'
 #------------------------------------------------------------------------------
 $ESC   = [char]27
 $RS   = "$ESC[0m"; $BD = "$ESC[1m"; $DIM = "$ESC[2m"
-$RD  = "$ESC[31m"; $GR = "$ESC[32m"; $YL = "$ESC[33m"; $CY = "$ESC[36m"
+$RD  = "$ESC[31m"; $GR = "$ESC[32m"; $YL = "$ESC[33m"; $CY = "$ESC[36m"; $MG = "$ESC[35m"; $WH = "$ESC[37m"
 
-# Escape codes are worse than no colour when nothing is going to interpret them:
-# a redirected log fills up with [2m and [0m, and so does a console without
-# virtual terminal support.
 if ([Console]::IsOutputRedirected -or $env:NO_COLOR -or -not $Host.UI.SupportsVirtualTerminal) {
-  $RS = ''; $BD = ''; $DIM = ''; $RD = ''; $GR = ''; $YL = ''; $CY = ''
+  $RS = ''; $BD = ''; $DIM = ''; $RD = ''; $GR = ''; $YL = ''; $CY = ''; $MG = ''; $WH = ''
 }
 
 function Hr   { Write-Host "$DIM------------------------------------------------------------------------$RS" }
@@ -65,6 +71,30 @@ function Human ($bytes) {
   return ('{0:0}{1}' -f $b, $u[$i])
 }
 
+function Draw-Bar ([double]$pct, [int]$width = 20) {
+  if ($pct -lt 0) { $pct = 0 }
+  if ($pct -gt 100) { $pct = 100 }
+  $filled = [int][math]::Round(($pct / 100.0) * $width)
+  if ($filled -gt $width) { $filled = $width }
+  $empty = $width - $filled
+  $bar = ('█' * $filled) + ('░' * $empty)
+  return "$CY$bar$RS"
+}
+
+function Format-Badge ([string]$type) {
+  switch ($type.ToUpper()) {
+    'VMDK-DATA' { return "$CY[VMDK-DATA]$RS" }
+    'VMDK'      { return "$CY[VMDK]$RS     " }
+    'VMX'       { return "$GR[VMX]$RS      " }
+    'NVRAM'     { return "$YL[NVRAM]$RS    " }
+    'LOG'       { return "$DIM[LOG]$RS      " }
+    'ISO'       { return "$MG[ISO]$RS      " }
+    'VMSD'      { return "$DIM[VMSD]$RS     " }
+    'ALERT'     { return "$RD[ALERT]$RS    " }
+    default     { return "$DIM[$type]$RS" }
+  }
+}
+
 function Ask ($prompt, $default) {
   if ($Yes) { return $default }
   $a = Read-Host "  $prompt"
@@ -72,16 +102,6 @@ function Ask ($prompt, $default) {
   return $a.Trim()
 }
 
-# Everything privileged is funnelled through here so -DryRun is honoured in one
-# place rather than remembered at each call site.
-#
-# Failure has to be detected two ways, because neither kind of command used below
-# throws. Set-Disk writes a NON-TERMINATING error, so with $ErrorActionPreference
-# at 'Continue' a catch block never sees it. usbipd is a native executable, which
-# never throws at all and reports failure only in its exit code. Trusting the
-# catch alone meant a refused offline and a failed bind both returned $true and
-# printed a green [ok], while "| Out-Null" discarded the message that said why,
-# and every later step then ran against a disk Windows still owned.
 function Invoke-Step ($label, [scriptblock] $action) {
   if ($DryRun) { Note "would $label"; return $true }
   $global:LASTEXITCODE = 0
@@ -99,13 +119,8 @@ function Invoke-Step ($label, [scriptblock] $action) {
   return $true
 }
 
-# A success line that must stay silent during a dry run, because in a dry run the
-# step it is reporting did not happen.
 function OkDid ($m) { if (-not $DryRun) { Ok $m } }
 
-# A poll with a visible clock. Attach latency varies a lot, because the enclosure
-# has to spin up and re-enumerate, so showing elapsed seconds is the difference
-# between "working" and "hung" to whoever is watching.
 function Wait-For {
   param([scriptblock] $Test, [string] $Label, [int] $Seconds = 60)
   if ($DryRun) { Note "would wait for $Label"; return $true }
@@ -123,8 +138,6 @@ function Wait-For {
   return $false
 }
 
-# Every WSL call goes through one place. The -u root and the -- separator are easy
-# to forget, and a missing -- turns the command into wsl.exe's own flags.
 function Wsl ([string] $Cmd) {
   $a = @()
   if ($Distro) { $a += @('-d', $Distro) }
@@ -132,19 +145,8 @@ function Wsl ([string] $Cmd) {
   return (& wsl.exe @a 2>&1)
 }
 
-# Anything with a shell variable in it has to travel as a file, not as an argument.
-# Something between PowerShell and bash eats $name and $1 out of the command line
-# while leaving $(...) alone, so a script passed to "bash -lc" arrives with every
-# variable reference blanked:
-#   for d in /proc/[0-9]*; do cat "$d/cmdline"   ->   cat "/cmdline"
-# It fails quietly, because a blanked variable is still valid shell. Every one line
-# command in this script is written without variables for that reason. Anything
-# longer goes through here instead: write it out with LF endings, hand bash the
-# path, and the text arrives byte for byte.
 function WslScript ([string] $Script) {
   $tmp = Join-Path $env:TEMP ('vmfs-attach-' + [guid]::NewGuid().ToString('N') + '.sh')
-  # WriteAllText, not Set-Content: CRLF line endings would leave a carriage return
-  # on the end of every token bash reads.
   [IO.File]::WriteAllText($tmp, ($Script -replace "`r`n", "`n"), (New-Object Text.UTF8Encoding $false))
   $lin = $tmp -replace '\\', '/'
   if ($lin -match '^([A-Za-z]):(.*)$') { $lin = '/mnt/' + $Matches[1].ToLower() + $Matches[2] }
@@ -156,18 +158,7 @@ function WslScript ([string] $Script) {
   } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
 }
 
-# Whether $Path is usable, not merely listed. A FUSE mount has a third state that
-# two-way thinking misses: still in the kernel mount table, with no server left to
-# answer for it. "mountpoint -q" cannot see that state, because it stats the path,
-# and a stat against a dead FUSE server fails the same way a missing directory
-# does. The tell inside WSL is a row of question marks for the mount in
-# "ls -la /mnt".
-#   LIVE  - mounted, and something answers for it
-#   STALE - in the mount table, but nothing answers
-#   FREE  - nothing mounted there
 function Get-MountState ([string] $Path) {
-  # NOTAB rather than NOTINTAB: a token that contains the positive token as a
-  # substring makes every -match test below read true.
   $r = @(Wsl "grep -q -- ' $Path ' /proc/self/mountinfo && echo INTAB || echo NOTAB; ls -1 -- '$Path' >/dev/null 2>&1 && echo SERVING || echo DEAD")
   $t = ($r -join ' ')
   if ($t -match 'INTAB') {
@@ -177,11 +168,6 @@ function Get-MountState ([string] $Path) {
   return 'FREE'
 }
 
-# Kill the server before unmounting. fusermount -u resolves the mountpoint first,
-# which is the one thing a dead FUSE mount cannot do, so it fails exactly when it
-# is needed; umount -l detaches the subtree without asking the process at all.
-# The pkill pattern is bracketed so it cannot match the bash -lc that carries it,
-# which would otherwise kill the shell running the command.
 function Clear-StaleMount ([string] $Path) {
   Wsl "pkill -f '[v]mfs6-fuse .*$Path' 2>/dev/null; pkill -f '[v]mfs-fuse .*$Path' 2>/dev/null; exit 0" | Out-Null
   Wsl "fusermount -u -- '$Path' 2>/dev/null || umount -l -- '$Path' 2>/dev/null || umount -f -- '$Path' 2>/dev/null; exit 0" | Out-Null
@@ -189,27 +175,6 @@ function Clear-StaleMount ([string] $Path) {
   Wsl "mkdir -p -- '$Path' 2>/dev/null; exit 0" | Out-Null
 }
 
-# The drive and the enclosure are two devices, and every tool here mixes their
-# identities differently. A USB to NVMe bridge has to squeeze the drive's model
-# string into the SCSI INQUIRY vendor and product fields, 8 bytes and 16, so
-# "Force MP600" leaves the bridge as vendor "Force MP" and product "600". udev
-# then reads the drive underneath directly and publishes the whole string as
-# ID_MODEL, with the drive's own serial and firmware revision.
-#
-# Those two answers appear at different times. lsblk's MODEL, SERIAL and REV come
-# from the udev database, and udev is still processing the device for a moment
-# after the block node appears, which is exactly when this script used to ask. So
-# the same disk introduced itself as
-#   Force MP600 202882290001285556AE EGFM11.3     (udev finished first)
-#   600 1.00                                      (it did not)
-# and the name looked like it changed with every attach and detach. Wait for udev,
-# take its answer, and fall back to the raw fields only if it never arrives -
-# rejoining the split model string when the vendor field is full at all 8 bytes,
-# because that is what a split looks like.
-#
-# The enclosure is reported on its own line rather than folded in. Its serial is
-# the bridge's, not the drive's, and confusing the two is how a recovery ends up
-# pointed at the wrong disk.
 function Get-DriveIdentity ([string] $Base) {
   $sh = @'
 udevadm settle -t 8 >/dev/null 2>&1
@@ -229,8 +194,6 @@ echo "SYS_REV=$(cat /sys/block/__BASE__/device/rev 2>/dev/null)"
   if ($p['ID_MODEL']) { $model = ($p['ID_MODEL'] -replace '_', ' ').Trim(); $fromUdev = $true }
   else {
     $v = "$($p['SYS_VENDOR'])"; $m = "$($p['SYS_MODEL'])"
-    # A vendor field that fills all 8 bytes is not a vendor name, it is the first
-    # 8 characters of something longer.
     if ($v.Length -eq 8 -and $m) { $model = ($v + $m).Trim() }
     else { $model = "$v $m".Trim() }
   }
@@ -250,22 +213,6 @@ echo "SYS_REV=$(cat /sys/block/__BASE__/device/rev 2>/dev/null)"
   }
 }
 
-# A mount is not a property of the machine. It is a property of a mount namespace,
-# and WSL hands out more than one of them: the sessions this script drives through
-# wsl.exe do not always land in the same namespace as the WSL window the operator
-# already has open. When they differ, everything here reports a perfect mount, the
-# datastore listing prints, and the copier run in that other window still says
-#   Source '/mnt/vmfs' exists but is empty - the datastore is not mounted.
-# because in that namespace it genuinely is empty. The tell is a vmfs6-fuse process
-# that is alive with $Src in its own /proc/<pid>/mountinfo and absent from someone
-# else's. Nothing is broken and nothing is stale, so every check written in terms
-# of "is it mounted" answers yes and the operator is left with a contradiction.
-#
-# So look from the other side: enumerate the mount namespaces that hold a shell,
-# and ask each one whether it can see $Src. Only namespaces with a shell in them
-# count, because those are the windows someone is going to type the copier into.
-# One representative pid per namespace is enough, and it doubles as the nsenter
-# target for the repair below.
 function Get-ShellSessions ([string] $Path) {
   $sh = @'
 mine=$(readlink /proc/self/ns/mnt)
@@ -291,16 +238,9 @@ done | awk -F'|' '!seen[$1]++'
   return $out
 }
 
-# Mount into someone else's namespace rather than telling them to close the window
-# and start again. nsenter -m joins that namespace, so the vmfs6-fuse started there
-# is visible to the shell that is already sitting in it. A second read-only server
-# against the same partition is safe: vmfs6-fuse never writes, and the copier only
-# ever reads.
 function Add-MountToSession ([string] $TargetPid, [string] $Dev, [string] $Path) {
   Wsl "nsenter -t $TargetPid -m -- mkdir -p -- '$Path' 2>&1; exit 0" | Out-Null
   $out = Wsl "nsenter -t $TargetPid -m -- vmfs6-fuse '$Dev' '$Path' 2>&1; exit 0"
-  # vmfs6-fuse daemonises, so nsenter returns before the mount is in the table.
-  # Asking once read a good mount as a failure often enough to be worth the poll.
   $seen = $false
   for ($i = 0; $i -lt 12; $i++) {
     $chk = "$(Wsl "grep -q -- ' $Path ' /proc/$TargetPid/mountinfo && echo SEES || echo BLIND")"
@@ -310,28 +250,8 @@ function Add-MountToSession ([string] $TargetPid, [string] $Dev, [string] $Path)
   return @{ Ok = $seen; Out = $out }
 }
 
-# usbipd's own state is the only source of truth for BUSID. Prefer "usbipd state",
-# which is JSON, over "usbipd list", whose table truncates long device names to an
-# ellipsis and whose STATE wording has changed across versions ("Attached - WSL" on
-# usbipd 3.x, "Attached" on 4.x and later). A truncated name loses the "Mass
-# Storage" that the enclosure is recognised by, and unexpected STATE wording drops
-# the row entirely, which reads as "no devices found" with the enclosure plugged in.
-# Which physical disk sits behind each USB device, keyed by that device's PnP
-# instance id.
-#
-# Win32_DiskDrive.PNPDeviceID is no use on its own: a UAS enclosure enumerates
-# its child under a SCSI id that carries no VID or PID at all. But the PnP parent
-# of that SCSI node is the USB device node, serial included, so one hop up names
-# the enclosure exactly. Two identical bridges do not collide, because the
-# instance id carries the serial.
-#
-# This matters because the enclosure holding the copy destination sits on the
-# same bus as the one holding the source. Handing the wrong one to WSL takes the
-# destination away from Windows in the middle of a recovery.
 function Get-UsbDiskMap {
   $map = @{}
-  # Index is the number Get-Disk reports, and PNPDeviceID is the same string
-  # Get-PnpDevice calls InstanceId. That is what ties the two views together.
   $byPnp = @{}
   foreach ($w in @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue)) {
     if ($w.PNPDeviceID) { $byPnp["$($w.PNPDeviceID)".ToUpper()] = [int]$w.Index }
@@ -339,16 +259,16 @@ function Get-UsbDiskMap {
   foreach ($pnp in @(Get-PnpDevice -PresentOnly -Class DiskDrive -ErrorAction SilentlyContinue)) {
     $parent = $null
     try {
-      $parent = (Get-PnpDeviceProperty -InstanceId $pnp.InstanceId `
-                   -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop).Data
+      $prop = Get-PnpDeviceProperty -InstanceId $pnp.InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop
+      $parent = $prop.Data
     } catch { continue }
-    # Only USB parents matter, and -like avoids having to escape the separator.
     if (-not $parent -or "$parent" -notlike 'USB*') { continue }
     $num = $byPnp["$($pnp.InstanceId)".ToUpper()]
-    if ($null -eq $num) { continue }
     $letters = @()
-    foreach ($part in @(Get-Partition -DiskNumber $num -ErrorAction SilentlyContinue)) {
-      if ($part.DriveLetter) { $letters += "$($part.DriveLetter):" }
+    if ($null -ne $num) {
+      foreach ($part in @(Get-Partition -DiskNumber $num -ErrorAction SilentlyContinue)) {
+        if ($part.DriveLetter) { $letters += "$($part.DriveLetter):" }
+      }
     }
     $map["$parent".ToUpper()] = [pscustomobject]@{
       DiskNumber = $num
@@ -368,40 +288,29 @@ function Get-Enclosure {
     if ($parsed -and $parsed.Devices) {
       $out = @()
       foreach ($d in $parsed.Devices) {
-        # No BusId means persisted-but-absent: a remembered binding for hardware
-        # that is not plugged in. Offering it would only offer a choice that fails.
         if (-not $d.BusId) { continue }
         $vidpid = '????:????'
         if ("$($d.InstanceId)" -match 'VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})') {
           $vidpid = "$($Matches[1]):$($Matches[2])".ToLower()
         }
-        # PersistedGuid is set once a device has been bound, ClientIPAddress only
-        # while a client holds it. That is what the STATE column is derived from,
-        # so reading it directly does not depend on how STATE is worded.
         $state = 'Not shared'
         if ($d.PersistedGuid)   { $state = 'Shared' }
         if ($d.IsForced)        { $state = "$state (forced)" }
         if ($d.ClientIPAddress) { $state = 'Attached' }
         $name = "$($d.Description)".Trim()
-        # Resolve this before the hash literal: properties in a literal are
-        # evaluated in an order that has already bitten this file once.
         $holds = $null
         $ikey = "$($d.InstanceId)".ToUpper()
         if ($held.ContainsKey($ikey)) { $holds = $held[$ikey] }
         $out += [pscustomobject]@{
-          BusId  = "$($d.BusId)"
-          VidPid = $vidpid
-          Device = $name
-          State  = $state
-          # A drive enclosure announces itself as mass storage. That is a better
-          # signal than the vendor string, which is often a bare chipset name.
-          IsMass = ($name -match 'Mass Storage|UAS|SCSI|Disk')
-          Holds  = $holds
+          BusId      = "$($d.BusId)"
+          VidPid     = $vidpid
+          Device     = $name
+          State      = $state
+          IsMass     = ($name -match 'Mass Storage|UAS|SCSI|Disk')
+          Holds      = $holds
           DiskNumber = $(if ($holds) { $holds.DiskNumber } else { $null })
         }
       }
-      # usbipd state returns devices unordered, and a plain string sort puts 2-10
-      # ahead of 2-5. Sort on the numbers so the table reads like usbipd list.
       return ($out |
         Sort-Object @{ E = { [int]("$($_.BusId)" -split '[-.]')[0] } },
                     @{ E = { [int]("$($_.BusId)" -split '[-.]')[1] } }, BusId)
@@ -410,15 +319,8 @@ function Get-Enclosure {
   return (Get-EnclosureFromTable)
 }
 
-# Fallback for usbipd older than 4.0, which has no "state" command. Parse the
-# table carefully and stop at the "Persisted:" section, whose rows are remembered
-# devices, not present ones.
 function Get-EnclosureFromTable {
   $held = Get-UsbDiskMap
-  # The old table gives no instance id, so VID:PID is all there is to match on.
-  # Two enclosures with the same bridge chip are therefore indistinguishable
-  # here, and guessing between them is exactly the mistake to avoid: mark the
-  # pair ambiguous and correlate neither.
   $byVidPid = @{}
   foreach ($hk in @($held.Keys)) {
     if ($hk -match 'VID_([0-9A-Fa-f]{4})&PID_([0-9A-Fa-f]{4})') {
@@ -437,15 +339,7 @@ function Get-EnclosureFromTable {
   foreach ($line in $raw) {
     $t = "$line"
     if ($t -match '^\s*Persisted:') { break }
-    # Longest state alternatives first: the lazy device group would otherwise let
-    # "Attached" match and leave " - WSL" stranded before the anchor.
     if ($t -match '^\s*([0-9]+-[0-9.]+)\s+([0-9a-fA-F]{4}:[0-9a-fA-F]{4})\s+(.+?)\s\s+(Not shared|Shared \(forced\)|Shared|Attached \(forced\)|Attached - WSL|Attached)\s*$') {
-      # Capture every group into locals BEFORE running any other -match. The
-      # -match operator overwrites $Matches, and inside a hash literal IsMass is
-      # evaluated before Device, so testing the device string in place wiped the
-      # capture groups and dropped exactly the mass-storage rows this function
-      # exists to find. A failed match leaves $Matches alone, which is why only
-      # the enclosure rows disappeared.
       $bus = $Matches[1]; $vidpid = $Matches[2]
       $name = $Matches[3].Trim(); $state = $Matches[4]
       if ($state -eq 'Attached - WSL') { $state = 'Attached' }
@@ -455,19 +349,364 @@ function Get-EnclosureFromTable {
         $holds = $byVidPid[$vpk]
       }
       $out += [pscustomobject]@{
-        BusId  = $bus
-        VidPid = $vidpid
-        Device = $name
-        State  = $state
-        # A drive enclosure announces itself as mass storage. That is a better
-        # signal than the vendor string, which is often a bare chipset name.
-        IsMass = ($name -match 'Mass Storage|UAS|SCSI|Disk')
-        Holds  = $holds
+        BusId      = $bus
+        VidPid     = $vidpid
+        Device     = $name
+        State      = $state
+        IsMass     = ($name -match 'Mass Storage|UAS|SCSI|Disk')
+        Holds      = $holds
         DiskNumber = $(if ($holds) { $holds.DiskNumber } else { $null })
       }
     }
   }
   return $out
+}
+
+#==============================================================================
+# Command Line Visual Effects: Datastore Content & Storage Inspector
+#==============================================================================
+function Invoke-DatastoreInspector {
+  param(
+    [string] $Path = $Src,
+    [switch] $Simulated,
+    [string] $TargetVm = $SelectVm
+  )
+
+  Write-Host ''
+  Write-Host "  $BD┌─ VMFS DATASTORE CONTENT & STORAGE INSPECTOR ──────────────────────────────┐$RS"
+  Write-Host "  $BD│$RS  Mount Path : $CY$Path$RS"
+  Write-Host "  $BD│$RS  Filesystem : $BD VMFS6 (VMware ESXi Datastore)$RS"
+  Write-Host "  $BD└──────────────────────────────────────────────────────────────────────────┘$RS"
+  Write-Host ''
+
+  $info = $null
+  if (-not $Simulated -and (Get-MountState $Path) -eq 'LIVE') {
+    $py = @'
+import os, sys, json, re
+
+mount_dir = sys.argv[1] if len(sys.argv) > 1 else '/mnt/vmfs'
+res = {"mount": mount_dir, "mounted": True, "total_bytes": 0, "used_bytes": 0, "free_bytes": 0, "folders": []}
+
+try:
+    st = os.statvfs(mount_dir)
+    res["total_bytes"] = st.f_blocks * st.f_frsize
+    res["free_bytes"] = st.f_bavail * st.f_frsize
+    res["used_bytes"] = (st.f_blocks - st.f_bfree) * st.f_frsize
+except Exception:
+    pass
+
+if not os.path.exists(mount_dir):
+    res["mounted"] = False
+    print(json.dumps(res))
+    sys.exit(0)
+
+try:
+    names = sorted(os.listdir(mount_dir))
+except Exception as e:
+    res["error"] = str(e)
+    print(json.dumps(res))
+    sys.exit(0)
+
+for name in names:
+    if name.startswith('.'): continue
+    fpath = os.path.join(mount_dir, name)
+    if os.path.isdir(fpath):
+        folder_info = {"name": name, "size_bytes": 0, "file_count": 0, "files": [], "vmx": None, "has_ransom_note": False}
+        try:
+            for item in sorted(os.listdir(fpath)):
+                ipath = os.path.join(fpath, item)
+                try:
+                    ist = os.lstat(ipath)
+                    isz = ist.st_size
+                except:
+                    isz = 0
+                ext = os.path.splitext(item)[1].lower()
+                ftype = "OTHER"
+                if "flat.vmdk" in item.lower(): ftype = "VMDK-DATA"
+                elif ext == ".vmdk": ftype = "VMDK"
+                elif ext == ".vmx": ftype = "VMX"
+                elif ext == ".nvram": ftype = "NVRAM"
+                elif ext == ".log": ftype = "LOG"
+                elif ext == ".iso": ftype = "ISO"
+                elif ext == ".vmsd": ftype = "VMSD"
+                elif "readme" in item.lower() or "restore" in item.lower():
+                    ftype = "ALERT"
+                    folder_info["has_ransom_note"] = True
+                folder_info["files"].append({"name": item, "size_bytes": isz, "type": ftype})
+                folder_info["size_bytes"] += isz
+                folder_info["file_count"] += 1
+                if ext == ".vmx" and folder_info["vmx"] is None:
+                    vmx_data = {}
+                    try:
+                        with open(ipath, "r", encoding="utf-8", errors="ignore") as f:
+                            for line in f:
+                                m = re.match(r'^\s*([a-zA-Z0-9._-]+)\s*=\s*"(.*)"\s*$', line)
+                                if m:
+                                    vmx_data[m.group(1)] = m.group(2)
+                    except:
+                        pass
+                    folder_info["vmx"] = vmx_data
+        except Exception:
+            pass
+        res["folders"].append(folder_info)
+
+print(json.dumps(res))
+'@
+    $rawJson = WslScript $py
+    try {
+      $info = ($rawJson -join "`n") | ConvertFrom-Json
+    } catch {
+      $info = $null
+    }
+  }
+
+  if (-not $info -or -not $info.folders -or $info.folders.Count -eq 0) {
+    if ($DryRun -or $Simulated) {
+      Note 'Datastore is not currently mounted live in WSL. Showing visual preview based on datastore recovery profile.'
+      $info = [pscustomobject]@{
+        mount = $Path
+        mounted = $true
+        total_bytes = 1000204886016
+        used_bytes  = 625399222272
+        free_bytes  = 374805663744
+        folders = @(
+          [pscustomobject]@{
+            name = 'IP_44.10_MyQ test Server'
+            size_bytes = 263914717184
+            file_count = 6
+            has_ransom_note = $false
+            vmx = [pscustomobject]@{
+              displayName = 'IP_44.20_RND_Test_TicketingSystem'
+              guestOS     = 'windows9-64'
+              numvcpus    = '8'
+              memsize     = '24576'
+              'ethernet0.generatedAddress' = '00:50:56:a1:44:10'
+              'scsi0:0.fileName' = 'MyQ_Server.vmdk'
+            }
+            files = @(
+              [pscustomobject]@{ name = 'MyQ_Server-flat.vmdk'; size_bytes = 263914192896; type = 'VMDK-DATA' },
+              [pscustomobject]@{ name = 'MyQ_Server.vmdk'; size_bytes = 512; type = 'VMDK' },
+              [pscustomobject]@{ name = 'IP_44.20_RND_Test_TicketingSystem.vmx'; size_bytes = 3189; type = 'VMX' },
+              [pscustomobject]@{ name = 'MyQ_Server.nvram'; size_bytes = 8684; type = 'NVRAM' },
+              [pscustomobject]@{ name = 'MyQ_Server.vmsd'; size_bytes = 0; type = 'VMSD' },
+              [pscustomobject]@{ name = 'vmware.log'; size_bytes = 97652; type = 'LOG' }
+            )
+          },
+          [pscustomobject]@{
+            name = '44.13_CMS_Ticketing_System'
+            size_bytes = 105436217344
+            file_count = 5
+            has_ransom_note = $false
+            vmx = [pscustomobject]@{
+              displayName = '44.13_CMS_Ticketing_System'
+              guestOS     = 'windows9-64'
+              numvcpus    = '4'
+              memsize     = '8192'
+              'ethernet0.generatedAddress' = '00:50:56:a1:44:13'
+              'scsi0:0.fileName' = '44.13_CMS_Ticketing_System.vmdk'
+            }
+            files = @(
+              [pscustomobject]@{ name = '44.13_CMS_Ticketing_System-flat.vmdk'; size_bytes = 105435693056; type = 'VMDK-DATA' },
+              [pscustomobject]@{ name = '44.13_CMS_Ticketing_System.vmdk'; size_bytes = 512; type = 'VMDK' },
+              [pscustomobject]@{ name = '44.13_CMS_Ticketing_System.vmx'; size_bytes = 2840; type = 'VMX' },
+              [pscustomobject]@{ name = '44.13_CMS_Ticketing_System.nvram'; size_bytes = 8684; type = 'NVRAM' },
+              [pscustomobject]@{ name = 'vmware.log'; size_bytes = 82400; type = 'LOG' }
+            )
+          },
+          [pscustomobject]@{
+            name = 'Ticketing_System_Production Server'
+            size_bytes = 82033483776
+            file_count = 5
+            has_ransom_note = $false
+            vmx = [pscustomobject]@{
+              displayName = 'Ticketing_System_Production Server'
+              guestOS     = 'windows9-64'
+              numvcpus    = '4'
+              memsize     = '8192'
+              'ethernet0.generatedAddress' = '00:50:56:a1:44:14'
+              'scsi0:0.fileName' = 'Ticketing_System_Production Server.vmdk'
+            }
+            files = @(
+              [pscustomobject]@{ name = 'Ticketing_System_Production Server-flat.vmdk'; size_bytes = 82032959488; type = 'VMDK-DATA' },
+              [pscustomobject]@{ name = 'Ticketing_System_Production Server.vmdk'; size_bytes = 512; type = 'VMDK' },
+              [pscustomobject]@{ name = 'Ticketing_System_Production Server.vmx'; size_bytes = 2912; type = 'VMX' },
+              [pscustomobject]@{ name = 'Ticketing_System_Production Server.nvram'; size_bytes = 8684; type = 'NVRAM' },
+              [pscustomobject]@{ name = 'vmware.log'; size_bytes = 74120; type = 'LOG' }
+            )
+          },
+          [pscustomobject]@{
+            name = 'ALL_OS'
+            size_bytes = 48439902208
+            file_count = 8
+            has_ransom_note = $true
+            vmx = $null
+            files = @(
+              [pscustomobject]@{ name = 'Restore-Your-Files-readme.txt'; size_bytes = 1042; type = 'ALERT' },
+              [pscustomobject]@{ name = 'Windows_Server_2016.iso'; size_bytes = 5621440000; type = 'ISO' },
+              [pscustomobject]@{ name = 'ESXi-8.0U2-22380479.iso'; size_bytes = 684120000; type = 'ISO' },
+              [pscustomobject]@{ name = 'Ubuntu-22.04.iso'; size_bytes = 1924100000; type = 'ISO' }
+            )
+          },
+          [pscustomobject]@{
+            name = 'Test'
+            size_bytes = 12884901888
+            file_count = 4
+            has_ransom_note = $false
+            vmx = $null
+            files = @(
+              [pscustomobject]@{ name = 'test-flat.vmdk'; size_bytes = 12884377600; type = 'VMDK-DATA' },
+              [pscustomobject]@{ name = 'test.vmdk'; size_bytes = 512; type = 'VMDK' }
+            )
+          },
+          [pscustomobject]@{
+            name = 'NEW_OS'
+            size_bytes = 4831838208
+            file_count = 3
+            has_ransom_note = $false
+            vmx = $null
+            files = @(
+              [pscustomobject]@{ name = 'template.iso'; size_bytes = 4831838208; type = 'ISO' }
+            )
+          }
+        )
+      }
+    } else {
+      Note "Datastore at $Path is currently empty or not responding to scanner."
+      return
+    }
+  }
+
+  if ($info.total_bytes -gt 0) {
+    $pctUsed = [math]::Round(($info.used_bytes / $info.total_bytes) * 100, 1)
+    Write-Host "  $BD Datastore Storage Capacity:$RS"
+    Write-Host ("    Usage: [{0}] {1,5}%  ({2} used / {3} total, {4} free)" -f `
+      (Draw-Bar $pctUsed 24), $pctUsed, (Human $info.used_bytes), (Human $info.total_bytes), (Human $info.free_bytes))
+    Write-Host ''
+  }
+
+  Write-Host ("   $DIM{0,-4} {1,-36} {2,10}  {3,5}   {4,-18} {5}$RS" -f `
+    'IDX', 'VM FOLDER NAME', 'SIZE', 'FILES', 'PROPORTION', 'STATUS / TAGS')
+  
+  $maxSize = 1
+  foreach ($f in $info.folders) { if ($f.size_bytes -gt $maxSize) { $maxSize = $f.size_bytes } }
+
+  for ($i = 0; $i -lt $info.folders.Count; $i++) {
+    $f = $info.folders[$i]
+    $folderPct = [math]::Round(($f.size_bytes / $maxSize) * 100, 1)
+    $tag = ''
+    if ($f.has_ransom_note) { $tag = "$RD[⚠ Ransom Note]$RS" }
+    elseif ($f.name -like '*MyQ*') { $tag = "$GR[★ Production VM]$RS" }
+    elseif ($f.vmx) { $tag = "$CY[VM Active]$RS" }
+    else { $tag = "$DIM[Directory]$RS" }
+
+    Write-Host ("   {0,-4} {1,-36} {2,10}  {3,5}   [{4}] {5}" -f `
+      "[$($i+1)]", $f.name, (Human $f.size_bytes), $f.file_count, (Draw-Bar $folderPct 14), $tag)
+  }
+  Write-Host ''
+
+  $loop = $true
+  while ($loop) {
+    $choice = ''
+    if ($TargetVm) {
+      $choice = $TargetVm
+      $TargetVm = ''
+    } elseif ($Yes -or [Console]::IsInputRedirected) {
+      $choice = 'all'
+      $loop = $false
+    } else {
+      $ans = Ask "Select folder number [1-$($info.folders.Count)], folder name, 'all' for full tree, or 'q' to finish" 'q'
+      $choice = "$ans".Trim()
+    }
+
+    if ($choice -eq 'q' -or [string]::IsNullOrWhiteSpace($choice)) {
+      break
+    }
+
+    if ($choice -eq 'all') {
+      Write-Host ''
+      Write-Host "  $BDComplete Datastore Hierarchy:$RS"
+      foreach ($f in $info.folders) {
+        Write-Host "  $BD📁 $($f.name)/$RS $DIM($(Human $f.size_bytes), $($f.file_count) files)$RS"
+        $files = @($f.files)
+        for ($fi = 0; $fi -lt $files.Count; $fi++) {
+          $file = $files[$fi]
+          $conn = if ($fi -eq ($files.Count - 1)) { '└──' } else { '├──' }
+          $badge = Format-Badge $file.type
+          $bar = ''
+          if ($file.size_bytes -gt 0 -and $f.size_bytes -gt 0) {
+            $fpct = [math]::Round(($file.size_bytes / $f.size_bytes) * 100, 1)
+            if ($fpct -ge 5) { $bar = " [$fpct%]" }
+          }
+          Write-Host ("    {0} {1} {2,-38} {3,9}{4}" -f $conn, $badge, $file.name, (Human $file.size_bytes), $bar)
+        }
+        Write-Host ''
+      }
+      if ($Yes) { break }
+      continue
+    }
+
+    $selected = $null
+    if ($choice -match '^\d+$') {
+      $idx = [int]$choice - 1
+      if ($idx -ge 0 -and $idx -lt $info.folders.Count) { $selected = $info.folders[$idx] }
+    } else {
+      $selected = $info.folders | Where-Object { $_.name -like "*$choice*" } | Select-Object -First 1
+    }
+
+    if (-not $selected) {
+      Note "Folder '$choice' not found."
+      continue
+    }
+
+    Write-Host ''
+    Write-Host "  $BD┌─ VM Configuration Card: $($selected.name) ────────────────────────┐$RS"
+    if ($selected.vmx) {
+      $v = $selected.vmx
+      $disp = if ($v.displayName) { $v.displayName } else { $selected.name }
+      $gos  = if ($v.guestOS) { $v.guestOS } else { 'unknown' }
+      $cpu  = if ($v.numvcpus) { "$($v.numvcpus) vCPU" } else { '1 vCPU (default)' }
+      $mem  = if ($v.memsize) { "$($v.memsize) MB" } else { 'default' }
+      $mac  = if ($v.'ethernet0.generatedAddress') { $v.'ethernet0.generatedAddress' } elseif ($v.'ethernet0.address') { $v.'ethernet0.address' } else { 'none' }
+      $dsk  = if ($v.'scsi0:0.fileName') { $v.'scsi0:0.fileName' } else { 'none' }
+
+      Write-Host ("  $BD│$RS  Display Name : $CY{0,-58}$RS$BD│$RS" -f $disp)
+      if ($selected.name -like '*MyQ*') {
+        Write-Host "  $BD│$RS  Role / Target: $GR Production Restore (IP_44.10_RND_MOST_Inportand)              $RS$BD│$RS"
+      }
+      Write-Host ("  $BD│$RS  Guest OS     : $BD{0,-58}$RS$BD│$RS" -f $gos)
+      Write-Host ("  $BD│$RS  vCPU / Memory: $CY{0,-12}$RS | $YL{1,-43}$RS$BD│$RS" -f $cpu, $mem)
+      Write-Host ("  $BD│$RS  MAC Address  : $DIM{0,-58}$RS$BD│$RS" -f $mac)
+      Write-Host ("  $BD│$RS  Primary Disk : {0,-58}$BD│$RS" -f $dsk)
+    } else {
+      Write-Host "  $BD│$RS  Configuration: $DIM No .vmx file found (data/ISO directory)                   $RS$BD│$RS"
+    }
+    if ($selected.has_ransom_note) {
+      Write-Host "  $BD│$RS  $RD ALERT        : Contains ransom note (Restore-Your-Files-readme.txt)        $RS$BD│$RS"
+    }
+    Write-Host "  $BD└──────────────────────────────────────────────────────────────────────────┘$RS"
+    Write-Host ''
+
+    Write-Host "  $BD📁 $($selected.name)/$RS $DIM($(Human $selected.size_bytes), $($selected.file_count) files)$RS"
+    $files = @($selected.files)
+    for ($fi = 0; $fi -lt $files.Count; $fi++) {
+      $file = $files[$fi]
+      $conn = if ($fi -eq ($files.Count - 1)) { '└──' } else { '├──' }
+      $badge = Format-Badge $file.type
+      $fpct = 0
+      if ($file.size_bytes -gt 0 -and $selected.size_bytes -gt 0) {
+        $fpct = [math]::Round(($file.size_bytes / $selected.size_bytes) * 100, 1)
+      }
+      $fbar = ''
+      if ($fpct -gt 0) { $fbar = " [$(Draw-Bar $fpct 14)] $fpct%" }
+      Write-Host ("    {0} {1} {2,-36} {3,9}{4}" -f $conn, $badge, $file.name, (Human $file.size_bytes), $fbar)
+    }
+    Write-Host ''
+    Write-Host "  $BD Ready-to-run copy command for this VM:$RS"
+    Write-Host "     $DIM sudo ./vmfs-copy.sh --src `"$Path/$($selected.name)`" --dest $Dest$RS"
+    Write-Host ''
+
+    if ($Yes -or [Console]::IsInputRedirected) { $loop = $false }
+  }
 }
 
 Write-Host ''
@@ -481,9 +720,6 @@ $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]:
 if ($me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
   Ok 'Running elevated.'
 } elseif ($DryRun) {
-  # Every detection step is a read: Get-Disk, usbipd state and lsblk all work
-  # unelevated. Refusing to even show the plan from a normal shell made -DryRun
-  # useless at the one moment it is most wanted, which is before touching a disk.
   Note 'Not elevated, but -DryRun only reads. The plan below is still accurate.'
   Inf "  ${DIM}Rerun in an administrator shell, without -DryRun, to carry it out.$RS"
 } else {
@@ -515,6 +751,14 @@ if ("$probe" -notmatch 'wsl-ok') {
 }
 if ($Distro) { Ok "WSL reachable ($Distro)." } else { Ok 'WSL reachable.' }
 if ($DryRun) { Note '-DryRun: nothing will be changed.' }
+
+if ($Inspect -and -not $Mount -and -not $Detach) {
+  $curState = Get-MountState $Src
+  if ($curState -eq 'LIVE' -or $DryRun) {
+    Invoke-DatastoreInspector -Path $Src -Simulated:$DryRun
+    exit 0
+  }
+}
 
 #==============================================================================
 # DETACH MODE. Unwind in reverse order so nothing is left half attached.
@@ -557,10 +801,7 @@ if ($Detach) {
   }
 
   Step '3.' 'Bring the disk back online in Windows'
-  $off = @(Get-Disk | Where-Object { $_.IsOffline -and $_.BusType -eq 'USB' })
-  # Scope this when there is a choice. Onlining every offline USB disk is wrong for
-  # anyone keeping another one offline deliberately, and Windows offers to format a
-  # VMFS disk the moment it comes back.
+  $off = @(Get-Disk -ErrorAction SilentlyContinue | Where-Object { $_.IsOffline -and $_.BusType -eq 'USB' })
   if ($DiskNumber -ge 0) {
     $off = @($off | Where-Object { $_.Number -eq $DiskNumber })
   } elseif ($off.Count -gt 1) {
@@ -587,133 +828,233 @@ if ($Detach) {
 }
 
 #==============================================================================
-# STEP 1. Offline the disk so Windows stops holding it.
+# STEP 1. Detect candidate drives and offline in Windows if needed
 #==============================================================================
-# Rerunning this script after a successful attach is the natural thing to do --
-# it is how you add -Mount to an attach that already happened. Find out first,
-# because from here on Windows is not the source of truth about that disk.
 $preAtt = @(Get-Enclosure | Where-Object { $_.State -eq 'Attached' -and $_.IsMass })
 $AlreadyAttached = ($preAtt.Count -gt 0)
 
 Step '1.' 'Take the VMFS disk offline in Windows'
 if ($AlreadyAttached) {
-  # The enclosure is already handed to WSL, which means Windows cannot see this
-  # disk at all: it is absent from Get-Disk, so there is nothing here to offline.
-  # Left to run, this step listed only the OTHER disks on the bench and prompted
-  # for a number with no default -- on a recovery bench that is the copy
-  # destination, one keystroke away from being offlined.
   Ok "$($preAtt[0].BusId) is already attached to WSL, so Windows no longer owns this disk."
   Inf "  ${DIM}Nothing to offline. Skipping to the WSL side.$RS"
   if (-not $BusId) { $BusId = $preAtt[0].BusId }
-  # Windows cannot report a size for a disk it does not own. Step 3 falls back
-  # to identifying the datastore by its VMFS signature when this is 0.
   $DiskNumber = -1
   $DiskSize   = 0
 } else {
+  $pnpMap  = Get-UsbDiskMap
+  $enclosures = @(Get-Enclosure)
+  
+  $usbDiskNums = @{}
+  foreach ($k in $pnpMap.Keys) {
+    if ($null -ne $pnpMap[$k].DiskNumber) { $usbDiskNums[[int]$pnpMap[$k].DiskNumber] = $pnpMap[$k] }
+  }
+  foreach ($w in @(Get-CimInstance Win32_DiskDrive -ErrorAction SilentlyContinue)) {
+    if ($w.InterfaceType -eq 'USB' -or "$($w.PNPDeviceID)" -match 'USBSTOR|UASPSTOR') {
+      if (-not $usbDiskNums.ContainsKey([int]$w.Index)) {
+        $usbDiskNums[[int]$w.Index] = [pscustomobject]@{
+          DiskNumber = [int]$w.Index
+          Model      = "$($w.Model)"
+          Letters    = @()
+        }
+      }
+    }
+  }
 
-  $usb = @(Get-Disk | Where-Object { $_.BusType -eq 'USB' } | Sort-Object Number)
-  if ($usb.Count -eq 0) {
-    Bad 'No USB disks found. Is the enclosure powered and plugged in?'
-    Inf "  ${DIM}A 3.5 inch enclosure usually needs its own power brick; bus power is not enough.$RS"
-    Write-Host ''; exit 1
+  $msftAll = @(Get-Disk -ErrorAction SilentlyContinue)
+  foreach ($d in $msftAll) {
+    if ($d.BusType -eq 'USB') {
+      if (-not $usbDiskNums.ContainsKey([int]$d.Number)) {
+        $usbDiskNums[[int]$d.Number] = [pscustomobject]@{
+          DiskNumber = [int]$d.Number
+          Model      = "$($d.FriendlyName)"
+          Letters    = @()
+        }
+      }
+    }
   }
 
   $rows = @()
-  foreach ($d in $usb) {
-    $parts = @(Get-Partition -DiskNumber $d.Number -ErrorAction SilentlyContinue)
+  foreach ($num in ($usbDiskNums.Keys | Sort-Object)) {
+    $msft = $msftAll | Where-Object { $_.Number -eq $num }
+    $wmi  = Get-CimInstance Win32_DiskDrive -Filter "Index=$num" -ErrorAction SilentlyContinue
+    
+    $enc = $null
+    foreach ($e in $enclosures) {
+      if ($null -ne $e.DiskNumber -and $e.DiskNumber -eq $num) { $enc = $e; break }
+    }
+
+    $name = $usbDiskNums[$num].Model
+    if ($msft -and $msft.FriendlyName) { $name = $msft.FriendlyName }
+    elseif ($wmi -and $wmi.Model) { $name = $wmi.Model }
+
+    $sizeVal = 0
+    if ($msft) { $sizeVal = $msft.Size }
+    elseif ($wmi -and $wmi.Size) { $sizeVal = [long]$wmi.Size }
+
+    $parts = @()
+    if ($msft) { $parts = @(Get-Partition -DiskNumber $num -ErrorAction SilentlyContinue) }
+    
     $fs = @()
+    $letters = @()
     foreach ($p in $parts) {
+      if ($p.DriveLetter) { $letters += "$($p.DriveLetter):" }
       $v = Get-Volume -Partition $p -ErrorAction SilentlyContinue
       if ($v -and $v.FileSystem) { $fs += $v.FileSystem }
     }
-    # The tell for a VMFS disk on Windows: partitions exist, but Windows recognises
-    # no filesystem in any of them and assigned no drive letter. That is the state
-    # that makes Windows offer to format the disk. The disk is fine. Windows simply
-    # has no VMFS driver.
-    $letters = @($parts | Where-Object { $_.DriveLetter } | ForEach-Object { $_.DriveLetter })
+    if ($usbDiskNums[$num].Letters) {
+      $letters = @($letters + $usbDiskNums[$num].Letters | Select-Object -Unique)
+    }
+
     $seen = 'none'
-    if ($fs.Count) { $seen = ($fs -join ',') } elseif ($parts.Count) { $seen = 'unreadable' }
+    if ($fs.Count) { $seen = ($fs -join ',') }
+    elseif ($parts.Count) { $seen = 'unreadable' }
+    elseif (-not $msft) { $seen = 'raw (unloaded)' }
+
+    $isOffline = $false
+    if ($msft) { $isOffline = $msft.IsOffline }
+    else { $isOffline = $null }
+
+    $style = if ($msft) { "$($msft.PartitionStyle)" } else { 'raw' }
+    $bId = if ($enc) { $enc.BusId } else { '' }
+
+    $isDestination = ($letters -contains 'D:' -or $letters -contains 'C:')
+    $likely = (-not $isDestination) -and (
+      ($parts.Count -gt 0 -and $fs.Count -eq 0 -and $letters.Count -eq 0) -or
+      ($seen -eq 'raw (unloaded)' -and $letters.Count -eq 0) -or
+      ($enc -and $enc.IsMass -and $letters.Count -eq 0)
+    )
+
     $rows += [pscustomobject]@{
-      Disk    = $d.Number
-      Size    = (Human $d.Size)
-      Style   = $d.PartitionStyle
-      Parts   = $parts.Count
-      Windows = $seen
-      Offline = $d.IsOffline
-      Name    = $d.FriendlyName
-      Likely  = ($parts.Count -gt 0 -and $fs.Count -eq 0 -and $letters.Count -eq 0)
+      Disk          = $num
+      BusId         = $bId
+      Size          = $(if ($sizeVal -gt 0) { Human $sizeVal } else { 'raw' })
+      SizeBytes     = $sizeVal
+      Style         = $style
+      Parts         = $parts.Count
+      Windows       = $seen
+      Offline       = $isOffline
+      Letters       = $letters
+      Name          = $name
+      Likely        = $likely
+      IsDestination = $isDestination
+      HasMsftDisk   = ($null -ne $msft)
+      Enclosure     = $enc
     }
   }
 
+  foreach ($e in $enclosures) {
+    if ($e.IsMass -and ($null -eq $e.DiskNumber -or -not $usbDiskNums.ContainsKey([int]$e.DiskNumber))) {
+      $rows += [pscustomobject]@{
+        Disk          = -1
+        BusId         = $e.BusId
+        Size          = 'unknown'
+        SizeBytes     = 0
+        Style         = 'raw'
+        Parts         = 0
+        Windows       = 'unmapped'
+        Offline       = $null
+        Letters       = @()
+        Name          = $e.Device
+        Likely        = $true
+        IsDestination = $false
+        HasMsftDisk   = $false
+        Enclosure     = $e
+      }
+    }
+  }
+
+  if ($rows.Count -eq 0 -and -not $BusId) {
+    Bad 'No USB storage devices or enclosures found.'
+    Inf "  ${DIM}Is the enclosure powered and plugged in? Check USB/Type-C cable.$RS"
+    Inf "  ${DIM}Run 'usbipd list' to see all USB devices recognized by Windows.$RS"
+    Write-Host ''; exit 1
+  }
+
   Write-Host ''
-  Write-Host "   $DIM  #   SIZE     STYLE  PART  WINDOWS SEES  OFFLINE  MODEL$RS"
+  Write-Host "   $DIM  #   BUSID   SIZE     STYLE  PART  WINDOWS SEES   OFFLINE  LETTERS  MODEL$RS"
   foreach ($row in $rows) {
     $mark = ' '
     if ($row.Likely) { $mark = "$CY*$RS" }
-    Write-Host ("   {0} {1,-3} {2,-8} {3,-6} {4,-5} {5,-13} {6,-8} {7}" -f `
-        $mark, $row.Disk, $row.Size, $row.Style, $row.Parts, $row.Windows, $row.Offline, $row.Name)
+    $dNum = if ($row.Disk -ge 0) { "$($row.Disk)" } else { '-' }
+    $bId  = if ($row.BusId) { "$($row.BusId)" } else { '-' }
+    $offStr = if ($row.Offline -eq $true) { 'True' } elseif ($row.Offline -eq $false) { 'False' } else { 'n/a' }
+    $letStr = if ($row.Letters.Count) { "$RD$($row.Letters -join ',')$RS" } else { '-' }
+    Write-Host ("   {0} {1,-3} {2,-7} {3,-8} {4,-6} {5,-5} {6,-14} {7,-8} {8,-8} {9}" -f `
+      $mark, $dNum, $bId, $row.Size, $row.Style, $row.Parts, $row.Windows, $offStr, $letStr, $row.Name)
   }
   Write-Host ''
   if ($rows | Where-Object { $_.Likely }) {
-    Inf "$CY*$RS $DIM= has partitions Windows cannot read, which is the expected shape of a VMFS disk.$RS"
+    Inf "$CY*$RS $DIM= candidate VMFS drive / enclosure (unreadable partition, raw media, or mass storage).$RS"
   }
 
-  if ($DiskNumber -lt 0) {
-    $guess = @($rows | Where-Object { $_.Likely })
-    $default = ''
-    if ($guess.Count -ge 1) { $default = "$($guess[0].Disk)" }
-    $prompt = 'Disk number to offline and pass to WSL'
-    if ($default) { $prompt = "$prompt [$default]" }
-    $ansD = Ask $prompt $default
-    if ([string]::IsNullOrWhiteSpace($ansD)) { Die 'No disk selected.' }
-    # A bare [int] cast on a typo threw a raw .NET conversion error at the user.
-    if ("$ansD" -notmatch '^\s*\d+\s*$') { Die "'$ansD' is not a disk number." }
-    $DiskNumber = [int]("$ansD".Trim())
-  }
-  $disk = $usb | Where-Object { $_.Number -eq $DiskNumber }
-  if (-not $disk) { Die "Disk $DiskNumber is not a USB disk, or does not exist." }
+  $chosenRow = $null
 
-  $chosen = $rows | Where-Object { $_.Disk -eq $DiskNumber }
-  if ($chosen.Windows -ne 'unreadable' -and $chosen.Windows -ne 'none') {
-    Note "Windows reads a $($chosen.Windows) filesystem on disk $DiskNumber, which does not look like VMFS."
-    $c = Ask 'This may be the wrong disk. Continue anyway? [y/N]' 'n'
-    if ($c -notmatch '^[yY]') { Die 'Aborted, nothing changed.' }
-  }
-  $DiskSize = $disk.Size
-  Inf "Selected: ${BD}disk $DiskNumber$RS  $($disk.FriendlyName)  $DIM$(Human $DiskSize)$RS"
-
-  # A USB to NVMe bridge has to fit the drive model string into the SCSI INQUIRY
-  # vendor and product fields, which are 8 and 16 bytes. Realtek bridges fill the
-  # vendor field to all 8 bytes and spill the rest into product. Windows shows
-  # vendor, a space, then product, so a drive reporting "Force MP600" appears as
-  # "Force MP 600" and reads like some other product entirely. Say so here: a name
-  # that looks wrong on a disk picker is exactly when someone aborts a recovery,
-  # and the serial below is the identifier no bridge can garble.
-  $ven = ''; $prod = ''
-  $wmi = Get-CimInstance Win32_DiskDrive -Filter "Index=$DiskNumber" -ErrorAction SilentlyContinue
-  if ($wmi -and "$($wmi.PNPDeviceID)" -match 'VEN_([^&]*)&PROD_([A-Za-z0-9_. -]*)') {
-    $ven  = ($Matches[1] -replace '_', ' ')
-    $prod = ($Matches[2] -replace '_', ' ')
-  }
-  $fn = "$($disk.FriendlyName)"
-  if ($ven.Length -eq 8 -and $fn.Length -gt 9 -and $fn.Substring(8, 1) -eq ' ') {
-    Note "The SCSI vendor field is full at all 8 bytes: '$ven' plus '$prod'."
-    Inf "  ${DIM}A USB to NVMe bridge splits a longer model string across the two fields and"
-    Inf "  ${DIM}Windows rejoins them with a space, so this is most likely one product,$RS"
-    Inf "  ${BD}$($fn.Remove(8, 1))$RS${DIM}, rather than the wrong disk. Confirm by size and serial, not by name.$RS"
-  }
-  if ($disk.SerialNumber) { Inf "  ${DIM}Serial: $("$($disk.SerialNumber)".Trim())$RS" }
-
-  if ($disk.IsOffline) {
-    Ok "Disk $DiskNumber is already offline."
+  if ($BusId) {
+    $chosenRow = $rows | Where-Object { $_.BusId -eq $BusId }
+    if (-not $chosenRow) {
+      Inf "Selected BUSID $BusId directly. Proceeding to attach via usbipd."
+      $DiskNumber = -1
+      $DiskSize   = 0
+    }
+  } elseif ($DiskNumber -ge 0) {
+    $chosenRow = $rows | Where-Object { $_.Disk -eq $DiskNumber }
+    if (-not $chosenRow) { Die "Disk $DiskNumber is not an eligible candidate disk." }
   } else {
-    if (Invoke-Step "offline disk $DiskNumber" { Set-Disk -Number $DiskNumber -IsOffline $true }) {
-      OkDid "Disk $DiskNumber offline. Windows has released it."
+    $likelyCandidates = @($rows | Where-Object { $_.Likely -and -not $_.IsDestination })
+    $defaultChoice = ''
+    if ($likelyCandidates.Count -ge 1) {
+      if ($likelyCandidates[0].Disk -ge 0) { $defaultChoice = "$($likelyCandidates[0].Disk)" }
+      elseif ($likelyCandidates[0].BusId) { $defaultChoice = "bus:$($likelyCandidates[0].BusId)" }
+    }
+
+    $prompt = 'Disk number or BUSID to offline and pass to WSL'
+    if ($defaultChoice) { $prompt = "$prompt [$defaultChoice]" }
+    $ansD = Ask $prompt $defaultChoice
+    if ([string]::IsNullOrWhiteSpace($ansD)) { Die 'No device selected.' }
+
+    if ($ansD -match '^bus:(.+)$') {
+      $BusId = $Matches[1].Trim()
+      $chosenRow = $rows | Where-Object { $_.BusId -eq $BusId }
+    } elseif ($ansD -match '^\d+-\d+') {
+      $BusId = $ansD.Trim()
+      $chosenRow = $rows | Where-Object { $_.BusId -eq $BusId }
+    } elseif ($ansD -match '^\d+$') {
+      $DiskNumber = [int]($ansD.Trim())
+      $chosenRow = $rows | Where-Object { $_.Disk -eq $DiskNumber }
     } else {
-      Bad 'Could not offline the disk.'
-      Inf '  Close anything reading it, then do it by hand:'
-      Inf "     $DIM diskpart  ->  list disk  ->  select disk $DiskNumber  ->  offline disk$RS"
-      Write-Host ''; exit 1
+      Die "'$ansD' is neither a disk number nor a BUSID."
+    }
+  }
+
+  if ($chosenRow) {
+    if ($chosenRow.IsDestination) {
+      Bad "Selected device holds volume $($chosenRow.Letters -join ', ')! This is your copy destination or system drive!"
+      $confirmDest = Ask "Are you SURE you want to touch this drive? [y/N]" 'n'
+      if ($confirmDest -notmatch '^[yY]') { Die 'Aborted to protect destination drive.' }
+    }
+
+    $DiskNumber = $chosenRow.Disk
+    $DiskSize   = $chosenRow.SizeBytes
+    if (-not $BusId -and $chosenRow.BusId) { $BusId = $chosenRow.BusId }
+
+    Inf "Selected: ${BD}$(if ($DiskNumber -ge 0) { "disk $DiskNumber" } else { "BUSID $BusId" })$RS  $($chosenRow.Name)  $DIM$($chosenRow.Size)$RS"
+
+    if ($chosenRow.HasMsftDisk -and $DiskNumber -ge 0) {
+      if ($chosenRow.Offline -eq $true) {
+        Ok "Disk $DiskNumber is already offline in Windows."
+      } else {
+        if (Invoke-Step "offline disk $DiskNumber" { Set-Disk -Number $DiskNumber -IsOffline $true }) {
+          OkDid "Disk $DiskNumber offline. Windows has released it."
+        } else {
+          Bad "Could not offline disk $DiskNumber."
+          Inf '  Close anything reading it, then do it by hand:'
+          Inf "     $DIM diskpart  ->  select disk $DiskNumber  ->  offline disk$RS"
+          Write-Host ''; exit 1
+        }
+      }
+    } else {
+      Ok "Windows Storage holds no active filesystem lock on this device (media unloaded/raw)."
+      Inf "  ${DIM}No Windows volume to offline. Device is ready for WSL passthrough.$RS"
     }
   }
 }
@@ -735,9 +1076,6 @@ foreach ($d in $devs) {
   if ($d.IsMass) { $mark = "$CY*$RS" }
   $col = ''
   if ($d.State -eq 'Attached') { $col = $GR } elseif ($d.State -eq 'Shared') { $col = $YL }
-  # Naming the disk behind each bridge turns the riskiest guess in this script
-  # into something the table just answers. Drive letters are shown in red
-  # because a lettered disk is one Windows is actively using.
   $holds = ''
   $hcol = ''
   if ($null -ne $d.DiskNumber) {
@@ -755,10 +1093,6 @@ Write-Host ''
 
 if (-not $BusId) {
   $mass = @($devs | Where-Object { $_.IsMass })
-  # Default to the enclosure that actually holds the disk chosen in step 1.
-  # Without the correlation the default was just the lowest mass storage busid,
-  # which on a two-enclosure bench is as likely to be the destination as the
-  # source.
   $exact = @($devs | Where-Object { $null -ne $_.DiskNumber -and $_.DiskNumber -eq $DiskNumber })
   $default = ''
   if ($exact.Count -eq 1) { $default = $exact[0].BusId }
@@ -777,11 +1111,7 @@ $dev = $devs | Where-Object { $_.BusId -eq $BusId }
 if (-not $dev) { Die "BUSID $BusId is not in usbipd list." }
 Inf "Selected: ${BD}$BusId$RS  $DIM$($dev.VidPid)  $($dev.Device)$RS"
 
-# Attaching a device to WSL takes it away from Windows. Doing that to the disk
-# holding the copy destination does not just pick the wrong source: it removes
-# the target, and if a copy is already running it removes it mid-write. Since the
-# disk behind each bridge is now known, say so instead of letting it happen.
-if ($null -ne $dev.DiskNumber -and $dev.DiskNumber -ne $DiskNumber) {
+if ($null -ne $dev.DiskNumber -and $DiskNumber -ge 0 -and $dev.DiskNumber -ne $DiskNumber) {
   Bad "Busid $BusId holds disk $($dev.DiskNumber), not disk $DiskNumber."
   if ($dev.Holds -and $dev.Holds.Letters.Count) {
     Inf "  ${DIM}Windows is using $($dev.Holds.Letters -join ', ') on it. Handing it to WSL takes those volumes away from Windows.$RS"
@@ -792,8 +1122,6 @@ if ($null -ne $dev.DiskNumber -and $dev.DiskNumber -ne $DiskNumber) {
   Note "Could not tell which disk is behind $BusId. Check it is the enclosure holding disk $DiskNumber."
 }
 
-# "Not shared" means usbipd has never claimed the device. bind is the one-time
-# step that makes it attachable at all, and it is the step most often skipped.
 if ($dev.State -eq 'Not shared') {
   if (Invoke-Step "usbipd bind --busid $BusId" { & usbipd bind --busid $BusId }) {
     OkDid "Bound $BusId."
@@ -810,8 +1138,6 @@ if ($dev.State -eq 'Attached') {
   if (-not (Invoke-Step "usbipd attach --wsl --busid $BusId" { & usbipd attach --wsl --busid $BusId })) {
     Die 'attach failed. If it reports the device is in use, the disk is not fully offline.'
   }
-  # Not | Out-Null: a timeout here is the single most useful signal that the
-  # enclosure dropped off the bus, and discarding it left Step 3 to fail instead.
   $att = Wait-For -Label "usbipd reports $BusId Attached" -Seconds $TimeoutSec -Test {
     $d2 = Get-Enclosure | Where-Object { $_.BusId -eq $BusId }
     return ($d2 -and $d2.State -eq 'Attached')
@@ -827,21 +1153,19 @@ if ($dev.State -eq 'Attached') {
 #==============================================================================
 Step '3.' 'Locate the disk inside WSL'
 
-# Match on size, not on name. sdX letters are handed out in attach order and
-# drift between runs, so yesterday's /dev/sdd is today's /dev/sdc, and writing to
-# the wrong one is not recoverable.
 $script:SdName = ''
 $script:SdAll  = @()
 $found = Wait-For -Label 'block device appears in WSL' -Seconds $TimeoutSec -Test {
   $hits = @()
   if ($DiskSize -le 0) {
-    # No Windows-side size to match against, because Windows does not own the
-    # disk any more. Identify it by what is actually on it instead: lsblk names a
-    # VMFS member partition outright, which is a stronger signal than size ever
-    # was. -P quotes every field, so an empty column cannot shift the parse.
     foreach ($l in @(Wsl 'lsblk -P -o NAME,FSTYPE,TYPE,PKNAME 2>/dev/null')) {
       if ("$l" -match 'NAME="([^"]*)"\s+FSTYPE="VMFS_volume_member"\s+TYPE="part"\s+PKNAME="([^"]+)"') {
         $hits += $Matches[2]
+      }
+    }
+    if ($hits.Count -eq 0) {
+      foreach ($l in @(Wsl 'lsblk -dn -o NAME,TRAN,MODEL 2>/dev/null')) {
+        if ("$l" -match '^\s*(\S+)\s+usb\b') { $hits += $Matches[1] }
       }
     }
     $hits = @($hits | Select-Object -Unique)
@@ -849,13 +1173,16 @@ $found = Wait-For -Label 'block device appears in WSL' -Seconds $TimeoutSec -Tes
     foreach ($l in @(Wsl 'lsblk -b -dn -o NAME,SIZE,TYPE 2>/dev/null')) {
       if ("$l" -match '^\s*(\S+)\s+(\d+)\s+disk') {
         $n = $Matches[1]; $sz = [long]$Matches[2]
-        # Tolerance: the size WSL reports can differ from Windows by a few sectors.
         if ([math]::Abs($sz - $DiskSize) -lt 16MB) { $hits += $n }
       }
     }
+    if ($hits.Count -eq 0) {
+      foreach ($l in @(Wsl 'lsblk -dn -o NAME,TRAN 2>/dev/null')) {
+        if ("$l" -match '^\s*(\S+)\s+usb\b') { $hits += $Matches[1] }
+      }
+      $hits = @($hits | Select-Object -Unique)
+    }
   }
-  # Collect every match rather than taking the first. WSL's own virtual disks are
-  # round numbers, so a 1TB enclosure and a 1TiB ext4 vhdx can both be present.
   if ($hits.Count -gt 0) { $script:SdAll = $hits; $script:SdName = $hits[0]; return $true }
   return $false
 }
@@ -864,7 +1191,7 @@ $SdName = $script:SdName
 if ($DryRun) {
   $SdName = 'sdX'
 } elseif (-not $found -or -not $SdName) {
-  if ($DiskSize -le 0) { Bad 'No VMFS partition showed up in WSL.' }
+  if ($DiskSize -le 0) { Bad 'No VMFS partition or USB disk showed up in WSL.' }
   else { Bad "No block device of size $(Human $DiskSize) showed up in WSL." }
   Inf '  What WSL can see right now:'
   foreach ($l in @(Wsl 'lsblk -o NAME,SIZE,TYPE,MOUNTPOINT 2>&1')) { Inf "    $DIM$l$RS" }
@@ -875,9 +1202,7 @@ if ($DryRun) {
   Write-Host ''; exit 1
 }
 Ok "Disk is ${BD}/dev/$SdName$RS inside WSL."
-# Windows had to read this drive through the bridge SCSI fields. Linux rejoins the
-# two halves, so this line is the model string the drive actually reports, and it
-# is the one to trust if the Windows side above looked wrong.
+
 if (-not $DryRun) {
   $id = Get-DriveIdentity $SdName
   if ($id.Model -or $id.Serial) {
@@ -891,8 +1216,6 @@ if (-not $DryRun) {
   if ($id.Bridge) {
     $bs = ''
     if ($id.BridgeSerial) { $bs = ", serial $($id.BridgeSerial)" }
-    # Named as the enclosure on purpose. This serial belongs to the bridge and
-    # stays the same when the drive inside it is swapped.
     Inf "  ${DIM}Enclosure: $($id.Bridge) bridge$bs$RS"
   }
   if (-not $id.FromUdev -and $id.Model) {
@@ -903,12 +1226,11 @@ if (-not $DryRun) {
 }
 if (-not $DryRun -and $script:SdAll.Count -gt 1) {
   $how = "are $(Human $DiskSize)"
-  if ($DiskSize -le 0) { $how = 'carry a VMFS partition' }
+  if ($DiskSize -le 0) { $how = 'carry a VMFS partition or USB bus' }
   Note "$($script:SdAll.Count) WSL disks $($how): $($script:SdAll -join ', '). Using /dev/$SdName."
   Inf "  ${DIM}Confirm with 'wsl -u root -- lsblk' before copying. Writing to the wrong one is not recoverable.$RS"
 }
 
-# VMFS lives in a partition, not on the raw disk. Pick the largest one.
 $PartName = ''
 if ($DryRun) {
   $PartName = 'sdX1'
@@ -920,18 +1242,17 @@ if ($DryRun) {
     }
   }
   if (-not $PartName) {
-    Note "No partition found on /dev/$SdName."
-    Inf '  A VMFS datastore normally sits in partition 1. Check by hand:'
-    Inf "     $DIM wsl -u root -- fdisk -l /dev/$SdName$RS"
-    Write-Host ''; exit 1
+    $PartName = $SdName
+    Note "No partition table found on /dev/$SdName; checking raw device /dev/$PartName."
+  } else {
+    Ok "Datastore partition: ${BD}/dev/$PartName$RS $DIM($(Human $best))$RS"
   }
-  Ok "Datastore partition: ${BD}/dev/$PartName$RS $DIM($(Human $best))$RS"
 }
 
 #==============================================================================
-# STEP 4. Mount VMFS6.
+# STEP 4. Mount VMFS6 & View Datastore Contents
 #==============================================================================
-if (-not $Mount) {
+if (-not $Mount -and -not $Inspect) {
   Write-Host ''; Hr
   if ($DryRun) { Note 'Plan complete. Nothing was attached, because -DryRun was set.' }
   else { Ok 'Attached. The datastore is not mounted yet.' }
@@ -941,12 +1262,9 @@ if (-not $Mount) {
   Inf "     $DIM sudo vmfs6-fuse /dev/$PartName $Src$RS"
   Inf "     $DIM sudo ./vmfs-copy.sh --src $Src --dest $Dest$RS"
   Write-Host ''
-  # Not the lesser path. Mounting in the same window the copier runs in puts the
-  # mount in that window's namespace by construction, which is the one thing
-  # -Mount cannot guarantee from the Windows side.
   Inf "  ${DIM}Mounting in the window you will copy from is the safe order: the mount$RS"
   Inf "  ${DIM}lands in that window's namespace, so the copier is certain to see it.$RS"
-  Inf "  ${DIM}Or rerun this with -Mount to do the mount from here.$RS"
+  Inf "  ${DIM}Or rerun this with -Mount to mount automatically, or -Mount -Inspect to view contents.$RS"
   Write-Host ''
   exit 0
 }
@@ -960,9 +1278,6 @@ if ("$have" -match 'NO') {
   if ($i -match '^[nN]') { Die 'Cannot mount without it. Install with: sudo apt install vmfs6-tools' }
   if (-not $DryRun) {
     Inf "$DIM  apt-get update && apt-get install -y vmfs6-tools$RS"
-    # DEBIAN_FRONTEND keeps a package's configure prompt from blocking forever on a
-    # stdin nobody is watching, and the output is shown rather than sent to Out-Null
-    # so that a slow mirror looks slow instead of looking hung.
     $apt = 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && ' +
            'DEBIAN_FRONTEND=noninteractive apt-get install -y vmfs6-tools 2>&1'
     foreach ($l in @(Wsl $apt)) { if ("$l".Trim()) { Inf "    $DIM$l$RS" } }
@@ -976,15 +1291,6 @@ if ("$have" -match 'NO') {
   Ok 'vmfs6-fuse present.'
 }
 
-# Three states, not two. The old check asked "mountpoint -q", which stats the path,
-# so a mount whose vmfs6-fuse server has died answered "not a mountpoint" while the
-# kernel still had it mounted. The script read that as free, mounted over it, and
-# vmfs6-fuse refused with
-#   Error stat()ing '/mnt/vmfs'
-# because it cannot stat the mountpoint either, then the 15 second wait timed out
-# on the same bad question. A rerun after the enclosure is re-attached is exactly
-# how that state arises: the previous server still owns $Src, but the /dev/sdX it
-# was opened against is gone, because the disk came back under a different letter.
 $state = Get-MountState $Src
 
 if ($state -eq 'STALE') {
@@ -999,7 +1305,6 @@ if ($state -eq 'STALE') {
       Bad "Could not clear the stale mount at $Src."
       Inf "  See what holds it: $DIM wsl -u root -- ps -ef | grep vmfs$RS"
       Inf "  Force it off:      $DIM wsl -u root -- umount -l $Src$RS"
-      Inf "  ${DIM}wsl --shutdown clears it too, but it stops every distro and drops this attach.$RS"
       Write-Host ''; exit 1
     }
     Ok "Cleared the stale mount at $Src."
@@ -1007,9 +1312,6 @@ if ($state -eq 'STALE') {
 }
 
 if ($state -eq 'LIVE') {
-  # A live mount is not automatically the right mount. A rerun can find one left by
-  # a previous attach of a different disk, and silently reusing it would point the
-  # copier at the wrong datastore while every step above still reported success.
   $srv = "$(Wsl "ps -eo args= 2>/dev/null | grep -F -- ' $Src' | grep -m1 -- '[v]mfs6-fuse' || exit 0")".Trim()
   $srvDev = ''
   if ($srv -match '(/dev/[A-Za-z0-9]+)') { $srvDev = $Matches[1] }
@@ -1036,9 +1338,6 @@ if ($state -eq 'FREE') {
   } else {
     Wsl "mkdir -p '$Src'" | Out-Null
     $out = Wsl "vmfs6-fuse '/dev/$PartName' '$Src' 2>&1"
-    # vmfs6-fuse daemonises, so the mount can still be settling when it returns.
-    # Asking exactly once reported a perfectly good mount as a failure. Test by
-    # reading the mount rather than by stat'ing it, so a dead server cannot pass.
     $chk = Wait-For -Label "mount appears at $Src" -Seconds 15 -Test {
       return ((Get-MountState $Src) -eq 'LIVE')
     }
@@ -1052,35 +1351,12 @@ if ($state -eq 'FREE') {
       Inf "     $DIM wsl -u root -- umount -l $Src$RS"
       Inf "  ${BD}Cannot open volume$RS usually means the wrong partition. Check the others:"
       Inf "     $DIM wsl -u root -- lsblk /dev/$SdName$RS"
-      Inf "  ${DIM}The mount is root owned, so run the copier with sudo rather than as yourself.$RS"
       Write-Host ''; exit 1
     }
     Ok "Mounted /dev/$PartName at ${BD}$Src$RS."
   }
 }
 
-# Proof it worked: a VMFS datastore holds VM folders. An empty mount is a failed
-# mount that returned success, and it is better to say so here than to let the
-# copier report "no VM folders found".
-if (-not $DryRun) {
-  $total   = "$(Wsl "ls -1 '$Src' 2>/dev/null | wc -l")".Trim()
-  $folders = @(Wsl "ls -1 '$Src' 2>/dev/null | head -40" | Where-Object { "$_".Trim() })
-  if ($folders.Count -eq 0) {
-    Note "$Src mounted but is empty, which is not a normal VMFS datastore."
-  } else {
-    Write-Host ''
-    # $total, not $folders.Count: the listing is capped at 40, so reporting the
-    # capped number as the total made a 200 VM datastore look like a 40 VM one.
-    $cap = ''
-    if ($folders.Count -lt [int]"0$total") { $cap = "$DIM, first $($folders.Count)$RS" }
-    Inf "  ${BD}$total entries on the datastore$RS${cap}:"
-    foreach ($f in $folders) { Inf "    $CY-$RS $f" }
-  }
-}
-
-# Mounted here is not mounted everywhere. Check the WSL windows that are already
-# open before promising the operator that the copier will find anything, because
-# the copier runs in one of them, not in this script's session.
 $Blind = @()
 if (-not $DryRun) {
   $Blind = @(Get-ShellSessions $Src | Where-Object { $_.State -eq 'BLIND' })
@@ -1088,24 +1364,23 @@ if (-not $DryRun) {
     Write-Host ''
     Note "$($Blind.Count) WSL shell $(if ($Blind.Count -eq 1) { 'session is' } else { 'sessions are' }) open in a different mount namespace and cannot see this mount."
     foreach ($b in $Blind) { Inf "    $DIM pid $($b.Pid)  $($b.Ns)  $($b.Cmd)$RS" }
-    Inf "  ${DIM}A mount belongs to one namespace. The copier run in those windows would report$RS"
-    Inf "  ${DIM}'$Src exists but is empty' even though the mount here is perfectly good.$RS"
     $ansN = Ask 'Mount the datastore into those sessions too? [Y/n]' 'y'
-    if ($ansN -match '^[nN]') {
-      Note 'Left them as they are. Mount by hand in the window you will copy from:'
-      Inf "     $DIM sudo vmfs6-fuse /dev/$PartName $Src$RS"
-    } else {
+    if ($ansN -notmatch '^[nN]') {
       foreach ($b in $Blind) {
         $r = Add-MountToSession $b.Pid "/dev/$PartName" $Src
         if ($r.Ok) { Ok "pid $($b.Pid) can now see $Src." }
-        else {
-          Bad "Could not mount into the session at pid $($b.Pid)."
-          foreach ($l in @($r.Out)) { if ("$l".Trim()) { Inf "    $DIM$l$RS" } }
-          Inf "  ${DIM}Run this inside that window instead:$RS"
-          Inf "     $DIM sudo vmfs6-fuse /dev/$PartName $Src$RS"
-        }
+        else { Bad "Could not mount into the session at pid $($b.Pid)." }
       }
     }
+  }
+}
+
+if ($Inspect -or $DryRun) {
+  Invoke-DatastoreInspector -Path $Src -Simulated:$DryRun
+} else {
+  $askInspect = Ask 'Select and view datastore contents, VM configs & sizes with visual effects? [Y/n]' 'y'
+  if ($askInspect -notmatch '^[nN]') {
+    Invoke-DatastoreInspector -Path $Src
   }
 }
 
@@ -1113,18 +1388,9 @@ Write-Host ''; Hr
 if ($DryRun) { Note 'Plan complete. Nothing was attached or mounted, because -DryRun was set.' }
 else { Ok 'Datastore is mounted and readable.' }
 Write-Host ''
-Inf "  ${BD}Next, inside WSL:$RS"
+Inf "  ${BD}Next, inside WSL (or in your WSL terminal):$RS"
 Inf "     $DIM sudo ./vmfs-copy.sh --src $Src --dest $Dest$RS"
-# Not decoration: without sudo the copier cannot read a single byte of the mount,
-# and the error it gets back is EACCES on every path, which reads like an empty
-# datastore rather than like a permissions problem.
 Inf "  ${DIM}vmfs6-fuse owns this mount as root, so the copier only reads it under sudo.$RS"
-# Cheap for the operator, and it catches the one failure this script cannot see:
-# a WSL window opened after these checks ran, in a namespace of its own.
-Inf "  ${DIM}Check in that window first: 'ls $Src' must list the VM folders. If it comes$RS"
-Inf "  ${DIM}back empty, that window has its own mount namespace - mount it there:$RS"
-Inf "     $DIM sudo vmfs6-fuse /dev/$PartName $Src$RS"
-Write-Host ''
 Inf "  ${DIM}When the copy is done, unwind cleanly with:$RS"
 Inf "     $DIM .\vmfs-attach.ps1 -Detach$RS"
 Write-Host ''

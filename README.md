@@ -235,8 +235,10 @@ sudo mkdir -p /mnt/vmfs && sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs   # sdX drifts, r
 
 [`vmfs-attach.ps1`](vmfs-attach.ps1) covers the half of the job the copier structurally cannot. `vmfs-copy.sh` runs **inside** WSL, and from in there it has no way to offline a Windows disk or bind a USB device to itself: `diskpart` and `usbipd` are Windows executables that need an elevated Windows shell. Those steps were manual, and a forgotten one looks exactly like an empty datastore.
 
+Running `.\vmfs-attach.ps1` with no flags launches the **interactive CLI dashboard** with live hardware detection, an operations menu, and a persistent navigation loop:
+
 ```powershell
-.\vmfs-attach.ps1                 # interactive graphical dashboard with all options
+.\vmfs-attach.ps1                 # interactive graphical dashboard with live status & menu loop
 .\vmfs-attach.ps1 -Mount          # offline the disk, attach to WSL, mount VMFS6
 .\vmfs-attach.ps1 -Mount -Inspect # mount and inspect datastore contents and sizes with visual effects
 .\vmfs-attach.ps1 -Inspect        # view datastore contents, VM configs, and copy commands
@@ -249,6 +251,37 @@ sudo mkdir -p /mnt/vmfs && sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs   # sdX drifts, r
 
 > [!IMPORTANT]
 > It must run in an **administrator** PowerShell. Offlining a disk and binding a USB device are both privileged operations, and the script refuses to continue rather than failing halfway through.
+
+### Interactive Dashboard & Menu Loop
+
+When invoked interactively, `vmfs-attach.ps1` renders a real-time status card and operation selector:
+
+```text
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  SYSTEM & HARDWARE STATUS                                              │
+  ├────────────────────────────────────────────────────────────────────────┤
+  │  PowerShell:       RUNNING ELEVATED (Admin)                            │
+  │  WSL2 Kernel:      READY (Ubuntu, Linux 5.15.167.4-microsoft-WSL2+)    │
+  │  USB Enclosure:    3-4  Realtek 9210 (Corsair MP600 PRO NH 932G)       │
+  │  VMFS Mount:       /mnt/vmfs  [LIVE]  (/dev/sdd1 mounted)              │
+  └────────────────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  OPERATION SELECTOR                                                    │
+  ├────────────────────────────────────────────────────────────────────────┤
+  │  [1]  🚀 Attach & Mount Datastore (Windows -> WSL passthrough)         │
+  │  [2]  🔍 Mount & Inspect Datastore Contents (visual storage inspector) │
+  │  [3]  🩺 Verify & Test Filesystem Health (VMFS6 metadata & extents)    │
+  │  [4]  🔄 Full Recovery Cycle (detach, re-attach, mount & test)         │
+  │  [5]  📁 Inspect Datastore Hierarchy & Virtual Machine Configs         │
+  │  [6]  🔌 Detach Enclosure & Return Disk Online                         │
+  │  [7]  📋 Dry-Run Simulation (preview all steps, change nothing)        │
+  │  [Q]  🚪 Exit                                                          │
+  └────────────────────────────────────────────────────────────────────────┘
+```
+
+> [!TIP]
+> **Persistent Menu Loop:** Every command and test pauses with `Press [Enter] to return to Main Menu, or 'q' to exit:`. Pressing **Enter** returns smoothly to the dashboard, letting you test, inspect, cycle, or detach without having to restart the script.
 
 ### What a run looks like
 
@@ -336,7 +369,48 @@ Run it a second time (to add `-Mount` to an attach that already happened, say) a
 
 ## 🖥 The Copier Script
 
-[`vmfs-copy.sh`](vmfs-copy.sh) is the heart of this repo, one interactive tool that **detects** every VM folder, lets you **select** which to pull, and copies each with the **right engine per file** and a **live progress bar**. It's built to be re-run: `ddrescue` mapfiles mean an interrupted copy **resumes**, it never restarts a disk image from zero.
+[`vmfs-copy.sh`](vmfs-copy.sh) is the heart of this repo, an interactive recovery engine that **detects** every VM folder, provides a **smart operations menu**, lets you **select** or **dry-run** your pull, and transfers each VM with the **right engine per file** (`ddrescue` for large flat images, `rsync` for metadata). It is built to be re-run: `ddrescue` mapfiles guarantee an interrupted copy **resumes**, never restarting a disk image from zero.
+
+### Interactive Dashboard & Live Status Card
+
+Running `sudo ./vmfs-copy.sh` with no flags launches the **interactive CLI dashboard**:
+
+```text
+  ╔══════════════════════════════════════════════════════════════════════════╗
+  ║     VMFS-6 DISK IMAGE EXTRACTION & DATASTORE RECOVERY ENGINE          ║
+  ║     Read-Only Source Extraction  •  ddrescue Resumable  •  rsync      ║
+  ╚══════════════════════════════════════════════════════════════════════════╝
+
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  ENVIRONMENT & STORAGE STATUS                                          │
+  ├────────────────────────────────────────────────────────────────────────┤
+  │  Source VMFS:      MOUNTED (LIVE)                                      │
+  │    Location:       /mnt/vmfs                                           │
+  │    Details:        /dev/sdd1 (fuse.vmfs6, ro,nodev,nosuid)             │
+  │  Destination:      /mnt/d                                              │
+  │    Free Space:     942.1G available     [████████░░░░░░░░] 52%         │
+  │  Recovery Vault:   /mnt/d/.vmfs-recovery                               │
+  │    Mapfiles:       3 session mapfile(s) on disk                        │
+  │  Engines:          ddrescue: READY              rsync: READY           │
+  │  Copy Config:      Big disk threshold: 1024 MB | Keep logs: NO         │
+  └────────────────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  OPERATION SELECTOR                                                    │
+  ├────────────────────────────────────────────────────────────────────────┤
+  │  [1]  🚀 Copy All Detected VMs (ddrescue + rsync)                       │
+  │  [2]  🎯 Select Specific VM(s) to Copy (interactive picker)            │
+  │  [3]  📋 Dry-Run Simulation (calculate byte demands & test)            │
+  │  [4]  📁 Inspect Source Datastore Folders & Storage Breakdown          │
+  │  [5]  🩺 Run Staged VM Verifier (verify-staged.sh audit)                │
+  │  [6]  📜 View ddrescue Mapfiles & Recovery Logs                        │
+  │  [7]  ⚙️  Configure Transfer Options (Threshold, Engines, Paths)         │
+  │  [Q]  🚪 Exit                                                          │
+  └────────────────────────────────────────────────────────────────────────┘
+```
+
+> [!TIP]
+> **Persistent Menu Loop:** Every command pauses with `Press [Enter] to return to Main Menu, or 'q' to exit:`. Pressing **Enter** refreshes the storage gauge and returns straight to the menu.
 
 ### What a run looks like
 
@@ -346,31 +420,24 @@ Run it a second time (to add `-Mount` to an attach that already happened, say) a
   <em>Detection, selection, space check, copy, all in one pass. The boxed <strong>DEST</strong> column is the whole point of re-running: <code>complete</code> is done, <code>absent</code> has never been touched, <code>partial 99%</code> resumes from the mapfile.</em>
 </div>
 
+During extraction, `vmfs-copy.sh` renders animated spinners and a real-time **Unicode block progress bar**:
+
 ```text
-  VMFS recovery copier
-  ────────────────────────────────────────────────────────────────────────
-  ✓ Running as root
-  ✓ Source mounted: /mnt/vmfs
-  ✓ ddrescue: /usr/bin/ddrescue
-  ✓ Destination: /mnt/d  (244.4G free)
-  ✓ Mapfiles/logs: /mnt/d/.vmfs-recovery
+  ⠋ Scanning /mnt/vmfs ...  ⠙ Probing VM: IP_44.10_MyQ test Server ...
 
-  Scanning /mnt/vmfs ...
+  ┌─────┬──────────────────────────────────────────┬───────────┬─────────┬──────────────────────┐
+  │ #   │ VM FOLDER                                │ SIZE      │ DISKS   │ DESTINATION          │
+  ├─────┼──────────────────────────────────────────┼───────────┼─────────┼──────────────────────┤
+  │ 1   │ IP_44.10_MyQ test Server                 │    94.4G  │ 1 vmdk  │ absent               │
+  │ 2   │ Ticketing_System_Production Server       │    61.2G  │ 1 vmdk  │ partial 38%          │
+  │ 3   │ 44.20_Software                           │    48.9G  │ 1 vmdk  │ complete (100%)      │
+  └─────┴──────────────────────────────────────────┴───────────┴─────────┴──────────────────────┘
+  3 folders, 204.5G total to copy. DISKS = .vmdk images >= 1024MB (ddrescue candidates).
 
-  #   VM FOLDER                                     SIZE  DISKS  DEST
+  [1/2] Transferring VM: IP_44.10_MyQ test Server
   ────────────────────────────────────────────────────────────────────────
-  1   IP_44.10_MyQ test Server                    94.4G      1  absent
-  2   Ticketing_System_Production Server          61.2G      1  partial 38%
-  3   44.20_Software                              48.9G      1  complete
-  ────────────────────────────────────────────────────────────────────────
-  3 folders, 204.5G to copy (excludes .vswp/.log). DISKS = .vmdk images >= 1024MB (ddrescue candidates).
-
-  Select folders [e.g. 1 3, 1-3, all, q]: 1-2
-
-  [1/2] IP_44.10_MyQ test Server
-  ────────────────────────────────────────────────────────────────────────
-    ddrescue -> IP_44.10_MyQ test Server-flat.vmdk (94.4G)
-    [############################..........]  74.19%  118MB/s  bad:0  12m03s
+    ddrescue -> MyQ_Server-flat.vmdk (94.4G)
+    [████████████████████████████░░░░░░░░░░]  74.19%  118MB/s  bad:0  12m03s
 ```
 
 <div align="center">
@@ -394,6 +461,72 @@ Run it without root and it stops before scanning, because it cannot read the mou
 ```
 
 That distinction matters more than it looks: the earlier version tested the mount with `[[ -d ]]`, which is *false* when `stat` returns `EACCES`, so a live datastore was reported as **missing** and the full re-attach runbook was printed for work that was already done.
+
+<img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
+
+## ✅ The Verifier Script
+
+[`verify-staged.sh`](verify-staged.sh) is a **100% read-only pre-flight auditor** that runs inside WSL2 to inspect what landed on your destination drive *before* you import anything into ESXi. It answers the question the copier can't: ***is this actually importable and will it boot?***
+
+Running `./verify-staged.sh` with no flags launches the **interactive verification dashboard**:
+
+```text
+  ╔══════════════════════════════════════════════════════════════════════════╗
+  ║       VMFS STAGED VM RESTORE VERIFIER & PRE-FLIGHT AUDITOR             ║
+  ║      Read-Only Integrity Checks  •  MBR/GPT Probing  •  ESXi Ready     ║
+  ╚══════════════════════════════════════════════════════════════════════════╝
+
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  VERIFICATION TARGET & HOST CONFIGURATION                              │
+  ├────────────────────────────────────────────────────────────────────────┤
+  │  Staged Destination:   /mnt/d                                          │
+  │    Staged VMs Found:   3 VM folder(s)  (204.5 GiB flat images)         │
+  │  Source Datastore:     /mnt/vmfs             LIVE FUSE MOUNT           │
+  │  Target Host RAM:      32768 MB  (ESXi Reserve: 6144 MB | Guest: 26624)│
+  │  VM Constraints:       Default (advisory)                              │
+  └────────────────────────────────────────────────────────────────────────┘
+
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  OPERATION SELECTOR                                                    │
+  ├────────────────────────────────────────────────────────────────────────┤
+  │  [1]  🔍 Run Complete 9-Point Verification Suite (All Staged VMs)       │
+  │  [2]  🎯 Verify Specific Staged VM Folder (interactive picker)          │
+  │  [3]  💾 Audit ESXi Host Resource Budget & Sizing Constraints          │
+  │  [4]  📜 Inspect ddrescue Mapfiles & Sector Integrity Logs              │
+  │  [5]  🗂️ View VM Descriptors & Flat Extent Byte Alignment               │
+  │  [6]  🧹 Scan for Dirty / Temporary Files (*.lck, *.vmem, *.vswp)       │
+  │  [7]  ⚙️  Configure Verification Constraints (Host RAM, Limits)         │
+  │  [Q]  🚪 Exit                                                          │
+  └────────────────────────────────────────────────────────────────────────┘
+```
+
+### The 9-Point Verification Suite
+
+1. **Image completeness**: Asserts flat image byte size matches **that VM's own descriptor extent** (`RW <sectors> VMFS`), and confirms `bad areas: 0` in ddrescue mapfiles/logs.
+2. **Boot structures**: Extracts sector 0 (protective MBR `0x55aa`) and sector 1 (`EFI PART` GPT header) directly off the copy with micro-spinner probing.
+3. **Descriptor agreement**: Validates extent declaration byte-for-byte against the `-flat.vmdk`.
+4. **VMX syntax & structure**: Confirms no duplicate keys, strict LF line endings (ESXi rejects CR), and clean `key = "value"` pairs.
+5. **Dead-host keys & CD-ROM**: Ensures host-pinned keys (`numa.autosize`, `migrate.hostLog`, `/vmfs/volumes/`) are scrubbed, and CD-ROM is auto-detect and disconnected.
+6. **Sizing & core divisibility**: Asserts `cpuid.coresPerSocket` divides evenly into `numvcpus` (ESXi refuses power-on if invalid) and audits guest RAM against host memory with a visual budget gauge:
+   ```text
+     Host RAM Budget: [██████████████░░░░░░] 68%  (22528 MB of 32768 MB)
+     [ ok ] leaves 10 GB for ESXi and headroom
+   ```
+7. **Identity preservation**: Verifies disk reference is relative (`fileName = "<name>.vmdk"`) and `uuid.bios` is retained.
+8. **Reversible backups**: Checks that `.vmx.original` or `.bak-*` files exist and diffs against the live mount.
+9. **Must not ship**: Scans for lock files (`*.lck`), memory swap (`*.vswp`), suspend state (`*.vmss`), and snapshot delta chains.
+
+At the end of an audit, a clear verdict card is rendered:
+
+```text
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  VERIFICATION AUDIT SUMMARY                                            │
+  ├────────────────────────────────────────────────────────────────────────┤
+  │  PASS: 19          FAIL: 0           WARN: 0                           │
+  ├────────────────────────────────────────────────────────────────────────┤
+  │  STATUS: [ ALL CHECKS PASSED - 100% READY FOR ESXi IMPORT ]            │
+  └────────────────────────────────────────────────────────────────────────┘
+```
 
 ### The three things it does that a plain `cp` won't
 
@@ -986,6 +1119,7 @@ sudo ./vmfs-copy.sh [options]
 | `--keep-logs` | off | Also copy `vmware-*.log` files |
 | `--dry-run`, `-n` | off | Print the plan + space check, copy nothing |
 | `--no-sudo` | off | Already root / source is readable, call tools directly |
+| `--menu`, `-m` | off | Force launch interactive operations menu dashboard |
 | `--help`, `-h` | (none) | Usage |
 
 **Design choices baked in:**
@@ -996,6 +1130,7 @@ sudo ./vmfs-copy.sh [options]
 - 🧾 **Verifies every folder**, compares apparent size of source vs destination and flags any real shortfall (excluded `.vswp`/`.log` are accounted for).
 - 🖱 **Flexible selection**, `1 3`, ranges `1-3`, `all`, or `q` to bail; de-duplicates overlapping picks.
 - 🎨 **Degrades gracefully**, no `ddrescue`? Falls back to `rsync`. No TTY? Drops the colors. Not root and no `sudo`? Warns instead of dying.
+- 🧭 **Persistent Menu Loop**, every action returns to the interactive dashboard when Enter is pressed.
 
 > [!NOTE]
 > **Common flag combos.** `--all --yes` = unattended full pull. `--dry-run` = see the plan, touch nothing. `--big-mb 512` = treat 512 MB+ images as `ddrescue` candidates. `--no-ddrescue` = healthy drive, want speed over bad-sector resilience.
@@ -1003,8 +1138,19 @@ sudo ./vmfs-copy.sh [options]
 ### `verify-staged.sh` (WSL)
 
 ```text
-./verify-staged.sh [--dest /mnt/d] [--src /mnt/vmfs] [--ram 8192] [--vcpu 4] [--host-ram 32768]
+./verify-staged.sh [options]
 ```
+
+| Flag | Default | Does |
+|---|---|---|
+| `--dest <path>` | `/mnt/d` | Destination drive holding staged VM folders |
+| `--src <path>` | `/mnt/vmfs` | Source mount point for live baseline `.vmx` diffs |
+| `--vm <name>` | all VMs | Verify a single specific VM folder under `--dest` |
+| `--ram <MB>` | advisory | Enforce exact `memSize` per VM |
+| `--vcpu <N>` | advisory | Enforce exact `numvcpus` per VM |
+| `--host-ram <MB>` | `32768` | Host physical RAM in MB for guest budget calculations |
+| `--menu`, `-m` | off | Force launch interactive verification dashboard |
+| `--help`, `-h` | (none) | Usage |
 
 Read-only pre-flight on what the copier produced, run **before** you import anything. It answers the question the copier can't: *is this actually importable?* Every folder holding a `-flat.vmdk` is checked, whatever its size.
 

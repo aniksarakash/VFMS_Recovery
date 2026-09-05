@@ -235,6 +235,8 @@ sudo mkdir -p /mnt/vmfs && sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs   # sdX drifts, r
 
 ```powershell
 .\vmfs-attach.ps1 -Mount          # offline the disk, attach to WSL, mount VMFS6
+.\vmfs-attach.ps1 -Mount -Inspect # mount and inspect datastore contents and sizes with visual effects
+.\vmfs-attach.ps1 -Inspect        # view datastore contents, VM configs, and copy commands
 .\vmfs-attach.ps1 -DryRun         # show the plan, change nothing
 .\vmfs-attach.ps1 -Detach         # unmount, detach, bring the disk back online
 ```
@@ -312,13 +314,14 @@ Run it a second time (to add `-Mount` to an attach that already happened, say) a
     Nothing to offline. Skipping to the WSL side.
 ```
 
-### The five things it does that a manual attach doesn't
+### The six things it does that a manual attach doesn't
 
-1. **Flags the likely VMFS disk instead of making you count.** The `*` marks any USB disk whose partitions exist but hold no filesystem Windows recognizes and no drive letter. That is precisely the state that makes Windows offer to format the disk, and it is the disk you want. If you pick one Windows *can* read, the script warns before touching it.
+1. **Detects candidate VMFS disks and enclosures across all hardware layers.** Searches across `MSFT_Disk`, `Win32_DiskDrive` (WMI), `Get-PnpDevice` (PnP), and `usbipd`. Reliably detects USB-C and USB 3.x NVMe and SATA enclosures (including Realtek RTL9210, ASMedia ASM2464, and JMicron bridges) even when Windows Storage has not mounted media (`MediaLoaded: False`, raw partition). The `*` marks any disk or enclosure with unreadable partitions, raw media, or mass storage with no Windows drive letters. If you pick one Windows *can* read, the script warns before touching it, and it strictly protects your destination drive (`D:`) from being pulled out from under a copy.
 2. **Names the disk behind each USB bridge, and refuses the wrong enclosure.** Attaching a device to WSL *takes it away from Windows*. On a bench with two identical bridge chips, picking the wrong busid does not merely grab the wrong source, it removes the copy destination from Windows, mid-write if a copy is running. The `HOLDS` column resolves each bridge to a disk number (and any drive letters, in red) by walking `DEVPKEY_Device_Parent` from every disk up to its USB node, which carries the serial and so cannot collide between identical chips. That makes the enclosure holding your chosen disk the *default*, and a busid that holds a different disk is refused unless you confirm it by name.
 3. **Matches the block device by size, not by name.** `sdX` letters are handed out in attach order, so yesterday's `/dev/sdd` is today's `/dev/sdc`. The script waits for a device whose size matches the Windows disk (within a few sectors) and reports the letter it actually found, then picks the largest partition on it. On a re-run Windows no longer owns the disk and cannot report a size at all, so it identifies the datastore by its VMFS signature instead: `lsblk` names a `VMFS_volume_member` partition outright, which is a stronger signal than size ever was.
 4. **Waits with a visible clock.** Attach and enumeration take anywhere from two to thirty seconds, because the enclosure has to spin up and re-enumerate. A spinner with elapsed seconds is the difference between "working" and "hung", and a timeout ends in a diagnosis rather than a hang: a device listed at `0B` means the enclosure dropped off the bus, which is almost always power.
 5. **Unwinds in the right order.** `-Detach` unmounts the FUSE mount first, then detaches the USB device, then brings the disk back online, and tells you which process is holding the mount if the unmount fails.
+6. **Inspects datastore contents and VM configs with command line visual effects.** Passing `-Inspect` (or `-View`) provides a terminal inspector with a storage capacity gauge, VM folder breakdown with proportional usage bars, and interactive drilldown into any VM folder. The drilldown displays a VM configuration card (extracting `displayName`, vCPUs, RAM, guest OS, MAC address, and virtual disk paths from `.vmx`), file breakdown with badges (`[VMDK]`, `[VMX]`, `[NVRAM]`, `[LOG]`), and prints the exact ready-to-run copier command for that VM.
 
 > [!NOTE]
 > The script never formats, partitions, or writes to the source disk. The only changes it makes on Windows are the disk's online/offline state and the `usbipd` binding, both of which `-Detach` reverses.

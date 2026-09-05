@@ -866,7 +866,7 @@ check_environment_prereqs
 
 # Non-interactive CLI mode: execute directly without interactive loop
 if ((!MENU_LOOP)); then
-  if ((ASSUME_ALL)); then
+  if ((ASSUME_ALL || DRY_RUN)); then
     do_copy_all
     exit $?
   else

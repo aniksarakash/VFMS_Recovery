@@ -201,7 +201,8 @@ cd VFMS_Recovery
 
 ```bash
 chmod +x vmfs-copy.sh
-sudo ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
+sudo ./vmfs-copy.sh                       # launches interactive graphical dashboard & menu
+# or non-interactive: sudo ./vmfs-copy.sh --all --yes --src /mnt/vmfs --dest /mnt/d
 ```
 
 `sudo` is not optional here. `vmfs6-fuse` owns the mount as root and does not pass `allow_other`, so to any other user *every* path under `/mnt/vmfs` fails with `EACCES`. Run the copier as yourself and it cannot read one byte of the datastore; it now says so and hands you the `sudo` line rather than claiming the source is missing.
@@ -210,7 +211,8 @@ sudo ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
 
 ```bash
 chmod +x verify-staged.sh
-./verify-staged.sh --dest /mnt/d
+./verify-staged.sh                        # launches interactive audit suite & budget validator
+# or non-interactive: ./verify-staged.sh --dest /mnt/d
 ```
 
 `bad areas: 0` means the *copy* was clean; it says nothing about whether the image still has a readable partition table at the other end. This reads sector 0 and 1 back **off the destination** and exits non-zero if anything fails, so you find out now rather than at power-on.

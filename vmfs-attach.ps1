@@ -76,7 +76,16 @@ function Inf  ($m) { Write-Host "  $m" }
 function Ok   ($m) { Write-Host "  $GR[ok]$RS $m" }
 function Note ($m) { Write-Host "  $YL[! ]$RS $m" }
 function Bad  ($m) { Write-Host "  $RD[xx]$RS $m" }
-function Die  ($m) { Bad $m; Write-Host ''; exit 1 }
+function Die  ($m) {
+  Bad $m
+  Write-Host ''
+  if ($script:menuLoop) {
+    Return-OrExit 1
+    throw [System.Management.Automation.PipelineStoppedException]::new()
+  } else {
+    exit 1
+  }
+}
 function Step ($n, $t) { Write-Host ''; Write-Host "  $CY$n$RS $BD$t$RS" }
 
 function Human ($bytes) {
@@ -1054,59 +1063,84 @@ function Show-InteractiveMenu {
   return "$c".Trim()
 }
 
-$isInteractiveInvocation = ($Menu -or (-not $Mount -and -not $Detach -and -not $Cycle -and -not $Test -and -not $Inspect -and -not $DryRun))
+$isInteractiveSession = ($Menu -or (-not $Mount -and -not $Detach -and -not $Cycle -and -not $Test -and -not $Inspect -and -not $DryRun))
+$script:menuLoop = ($isInteractiveSession -and -not $Yes)
 
-if ($isInteractiveInvocation -and -not $Yes) {
-  $menuChoice = Show-InteractiveMenu
-  switch ($menuChoice.ToUpper()) {
-    '1' {
-      $Mount = $true
-    }
-    '2' {
-      $Mount   = $true
-      $Inspect = $true
-    }
-    '3' {
-      $Test = $true
-      $curState = Get-MountState $Src
-      if ($curState -ne 'LIVE') {
-        $Mount = $true
-      }
-    }
-    '4' {
-      $Cycle = $true
-      $Mount = $true
-      $Test  = $true
-    }
-    '5' {
-      $Inspect = $true
-      $curState = Get-MountState $Src
-      if ($curState -ne 'LIVE') {
-        $Mount = $true
-      }
-    }
-    '6' {
-      $Detach = $true
-    }
-    '7' {
-      $DryRun  = $true
-      $Mount   = $true
-      $Inspect = $true
-      $Test    = $true
-    }
-    { $_ -in 'Q', 'QUIT', 'EXIT', '0' } {
+function Return-OrExit ([int]$Code = 0) {
+  if ($script:menuLoop) {
+    Write-Host ''
+    Hr
+    $ans = Ask "Press [Enter] to return to Main Menu, or 'q' to exit" ''
+    if ($ans -match '^[qQ]') {
       Write-Host ''
-      Inf "$DIMExited without making changes.$RS"
+      Inf "$DIMExited.$RS"
       Write-Host ''
-      exit 0
+      exit $Code
     }
-    default {
-      Note "Unknown choice '$menuChoice'; defaulting to Attach & Mount."
-      $Mount = $true
-    }
+    return
+  } else {
+    exit $Code
   }
 }
 
+while ($true) {
+  if ($script:menuLoop) {
+    $Mount   = $false
+    $Detach  = $false
+    $Cycle   = $false
+    $Test    = $false
+    $Inspect = $false
+    $DryRun  = $false
+
+    $menuChoice = Show-InteractiveMenu
+    switch ($menuChoice.ToUpper()) {
+      '1' {
+        $Mount = $true
+      }
+      '2' {
+        $Mount   = $true
+        $Inspect = $true
+      }
+      '3' {
+        $Test = $true
+        if ((Get-MountState $Src) -ne 'LIVE') {
+          $Mount = $true
+        }
+      }
+      '4' {
+        $Cycle = $true
+        $Mount = $true
+        $Test  = $true
+      }
+      '5' {
+        $Inspect = $true
+        if ((Get-MountState $Src) -ne 'LIVE') {
+          $Mount = $true
+        }
+      }
+      '6' {
+        $Detach = $true
+      }
+      '7' {
+        $DryRun  = $true
+        $Mount   = $true
+        $Inspect = $true
+        $Test    = $true
+      }
+      { $_ -in 'Q', 'QUIT', 'EXIT', '0' } {
+        Write-Host ''
+        Inf "$DIMExited without making changes.$RS"
+        Write-Host ''
+        exit 0
+      }
+      default {
+        Note "Unknown choice '$menuChoice'; returning to menu."
+        continue
+      }
+    }
+  }
+
+  try {
 Write-Host ''
 Write-Host "$BD  VMFS attach helper$RS  $DIM(Windows side of the recovery)$RS"
 Hr
@@ -1136,7 +1170,8 @@ if ($isAdmin) {
   Inf ''
   Inf "  ${DIM}Or preview the plan from this shell:  .\vmfs-attach.ps1 -DryRun$RS"
   Write-Host ''
-  exit 1
+  Return-OrExit 1
+  continue
 }
 
 if (-not $canSkipAdmin) {
@@ -1144,7 +1179,8 @@ if (-not $canSkipAdmin) {
     Bad 'usbipd not found. WSL cannot be handed a USB device without it.'
     Inf "  Install it, then reopen this shell:  $DIM winget install usbipd$RS"
     Inf "  ${DIM}or https://github.com/dorssel/usbipd-win/releases$RS"
-    Write-Host ''; exit 1
+    Return-OrExit 1
+    continue
   }
   Ok "usbipd present: $DIM$(& usbipd --version 2>&1 | Select-Object -First 1)$RS"
 }if (-not (Get-Command wsl -ErrorAction SilentlyContinue)) {
@@ -1166,7 +1202,8 @@ if (($Inspect -or $Test) -and -not $Mount -and -not $Detach -and -not $Cycle) {
     if ($Inspect -or -not $Test) {
       Invoke-DatastoreInspector -Path $Src -Simulated:$DryRun
     }
-    exit 0
+    Return-OrExit 0
+    continue
   }
 }
 
@@ -1255,7 +1292,8 @@ if ($Detach -or $Cycle) {
     else { Ok 'Detach complete.' }
     Note 'Leave the VMFS disk offline in Windows if you plan to reattach it. While it is online, Windows will offer to format it.'
     Write-Host ''
-    exit 0
+    Return-OrExit 0
+    continue
   }
 }
 
@@ -1399,7 +1437,8 @@ if ($AlreadyAttached) {
     Bad 'No USB storage devices or enclosures found.'
     Inf "  ${DIM}Is the enclosure powered and plugged in? Check USB/Type-C cable.$RS"
     Inf "  ${DIM}Run 'usbipd list' to see all USB devices recognized by Windows.$RS"
-    Write-Host ''; exit 1
+    Return-OrExit 1
+    continue
   }
 
   Write-Host ''
@@ -1481,7 +1520,8 @@ if ($AlreadyAttached) {
           Bad "Could not offline disk $DiskNumber."
           Inf '  Close anything reading it, then do it by hand:'
           Inf "     $DIM diskpart  ->  select disk $DiskNumber  ->  offline disk$RS"
-          Write-Host ''; exit 1
+          Return-OrExit 1
+          continue
         }
       }
     } else {
@@ -1631,7 +1671,8 @@ if ($DryRun) {
   Inf "  ${BD}If a device is listed at 0B$RS, the enclosure dropped off the bus. That is almost"
   Inf '  always power rather than data. Detach, power cycle the enclosure, attach again:'
   Inf "     $DIM usbipd detach --busid $BusId ; usbipd attach --wsl --busid $BusId$RS"
-  Write-Host ''; exit 1
+  Return-OrExit 1
+  continue
 }
 Ok "Disk is ${BD}/dev/$SdName$RS inside WSL."
 
@@ -1684,7 +1725,7 @@ if ($DryRun) {
 #==============================================================================
 # STEP 4. Mount VMFS6 & View Datastore Contents
 #==============================================================================
-if (-not $Mount -and -not $Inspect) {
+if (-not $Mount -and -not $Inspect -and -not $Test) {
   Write-Host ''; Hr
   if ($DryRun) { Note 'Plan complete. Nothing was attached, because -DryRun was set.' }
   else { Ok 'Attached. The datastore is not mounted yet.' }
@@ -1698,7 +1739,8 @@ if (-not $Mount -and -not $Inspect) {
   Inf "  ${DIM}lands in that window's namespace, so the copier is certain to see it.$RS"
   Inf "  ${DIM}Or rerun this with -Mount to mount automatically, or -Mount -Inspect to view contents.$RS"
   Write-Host ''
-  exit 0
+  Return-OrExit 0
+  continue
 }
 
 Step '4.' 'Mount the VMFS6 datastore'
@@ -1737,7 +1779,8 @@ if ($state -eq 'STALE') {
       Bad "Could not clear the stale mount at $Src."
       Inf "  See what holds it: $DIM wsl -u root -- ps -ef | grep vmfs$RS"
       Inf "  Force it off:      $DIM wsl -u root -- umount -l $Src$RS"
-      Write-Host ''; exit 1
+      Return-OrExit 1
+      continue
     }
     Ok "Cleared the stale mount at $Src."
   }
@@ -1783,7 +1826,8 @@ if ($state -eq 'FREE') {
       Inf "     $DIM wsl -u root -- umount -l $Src$RS"
       Inf "  ${BD}Cannot open volume$RS usually means the wrong partition. Check the others:"
       Inf "     $DIM wsl -u root -- lsblk /dev/$SdName$RS"
-      Write-Host ''; exit 1
+      Return-OrExit 1
+      continue
     }
     Ok "Mounted /dev/$PartName at ${BD}$Src$RS."
   }
@@ -1830,3 +1874,10 @@ Inf "  ${DIM}vmfs6-fuse owns this mount as root, so the copier only reads it und
 Inf "  ${DIM}When the copy is done, unwind cleanly with:$RS"
 Inf "     $DIM .\vmfs-attach.ps1 -Detach$RS"
 Write-Host ''
+
+  Return-OrExit 0
+  } catch [System.Management.Automation.PipelineStoppedException] {
+    continue
+  }
+  if (-not $script:menuLoop) { break }
+}

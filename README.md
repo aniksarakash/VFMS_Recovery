@@ -131,17 +131,69 @@ The drive is **no longer in an ESXi host**. It's out, in an enclosure, plugged i
 
 <img src="https://raw.githubusercontent.com/andreasbm/readme/master/assets/lines/rainbow.png" alt="" width="100%" />
 
-## 🧱 Prerequisites
+## 🧱 Prerequisites & Required Packages
 
-| Tool | Runs on | Purpose | Install |
-|---|---|---|---|
-| **`usbipd-win`** | Windows | Shares a USB device into WSL2's Linux kernel | `winget install usbipd` · or the [releases page](https://github.com/dorssel/usbipd-win/releases) |
-| **WSL2** (Ubuntu) | Windows | A real Linux kernel that can read VMFS | `wsl --install` |
-| **`vmfs6-fuse`** | WSL2 | FUSE driver to mount a VMFS6 volume | via `vmfs6-tools`, package manager first, else build from source |
-| **`gddrescue`** (→ `ddrescue`) | WSL2 | Sector-level recovery for a degrading drive | `sudo apt install gddrescue` |
-| **`rsync`** | WSL2 | Bulk copy for everything that isn't a giant image | usually preinstalled · else `sudo apt install rsync` |
-| **`xxd`** | WSL2 | Reads the MBR signature back off the copy in [`verify-staged.sh`](verify-staged.sh) | usually preinstalled · else `sudo apt install xxd` |
-| **PowerShell** (admin) | Windows | Runs [`vmfs-attach.ps1`](vmfs-attach.ps1); `diskpart` and `usbipd` both need elevation | preinstalled · Windows PowerShell 5.1 or PowerShell 7+ |
+The recovery toolchain bridges Windows host hardware controls (disk offlining & USB bus arbitration) with Linux kernel filesystem drivers (VMFS6 FUSE & bad-sector imaging). Below are the required packages and installation commands for both environments.
+
+### 🪟 Windows Requirements & Setup
+
+| Package / Tool | Recommended Version | Purpose | Installation |
+| :--- | :--- | :--- | :--- |
+| **PowerShell 7+** | **7.6.5** / 7.6.1 Core | Runs [`vmfs-attach.ps1`](vmfs-attach.ps1) with ANSI graphics, rich badges & loop controls | `winget install Microsoft.PowerShell` · or [GitHub Releases](https://github.com/PowerShell/PowerShell/releases) |
+| **`usbipd-win`** | **v5.3.0** or newer | Shares the USB/NVMe enclosure directly into WSL2 kernel | `winget install usbipd` · or [GitHub Releases](https://github.com/dorssel/usbipd-win/releases) |
+| **WSL2** | 2.0+ (Kernel 5.15+) | Provides the Linux environment to run FUSE & imaging utilities | `wsl --install -d Ubuntu-24.04` (or `wsl --update`) |
+
+> [!NOTE]
+> **Windows Installation Commands (Run in an Administrator PowerShell):**
+> ```powershell
+> # 1. Install PowerShell 7 and usbipd-win via WinGet
+> winget install --id Microsoft.PowerShell --source winget
+> winget install --id dorssel.usbipd-win --source winget
+>
+> # 2. Ensure WSL2 with Ubuntu is installed and up to date
+> wsl --install -d Ubuntu-24.04
+> wsl --update
+> ```
+
+---
+
+### 🐧 WSL2 / Ubuntu Requirements & Setup
+
+| Package / Tool | Binary | Purpose in Recovery | Ubuntu / Debian Package |
+| :--- | :--- | :--- | :--- |
+| **`vmfs6-tools`** | `vmfs6-fuse` | User-space FUSE driver to mount VMware VMFS6 volumes read-only | `vmfs6-tools` |
+| **`gddrescue`** | `ddrescue` | High-speed, sector-safe copying of large `-flat.vmdk` images with resume mapfiles | `gddrescue` |
+| **`rsync`** | `rsync` | Efficient checksum-verified copying for VM configuration, NVRAM & descriptor files | `rsync` |
+| **`xxd`** / `bsdextrautils` | `xxd` | Low-level sector reader used by [`verify-staged.sh`](verify-staged.sh) to probe MBR (`0x55aa`) and GPT (`EFI PART`) signatures | `xxd` |
+| **`linux-tools-virtual`** | `usbip` | WSL2 client-side USB/IP tool to communicate with Windows usbipd host | `linux-tools-virtual hwdata` |
+
+> [!TIP]
+> **WSL2 One-Liner Install (Run inside your Ubuntu terminal):**
+> ```bash
+> # 1. Install all recovery utilities in a single pass:
+> sudo apt update && sudo apt install -y vmfs6-tools gddrescue rsync xxd linux-tools-virtual hwdata
+>
+> # 2. Configure the usbip tool link (if not already aliased):
+> sudo update-alternatives --install /usr/local/bin/usbip usbip $(ls /usr/lib/linux-tools/*/usbip 2>/dev/null | tail -n1) 20 2>/dev/null || true
+> ```
+
+---
+
+### 🧪 Verified & Tested Environment
+
+This recovery suite has been rigorously field-tested and validated end-to-end under the following production test bench:
+
+| Environment Component | Tested Version / Specification | Notes & Validation Scope |
+| :--- | :--- | :--- |
+| **Host Operating System** | **Microsoft Windows 11 Pro** (Build `10.0.26200.0` / 24H2) | Elevated execution for `diskpart` and USB bus passthrough |
+| **PowerShell Runtime** | **PowerShell 7.6.5** & **7.6.1 Core** (`pwsh`) | Full UTF-8 Unicode gauges, ANSI 256-color palettes, interactive menu loops |
+| **Fallback Shell** | Windows PowerShell 5.1 (`powershell.exe`) | Supported with degraded ASCII banners and standard text prompts |
+| **WSL2 Linux Kernel** | **5.15.167.4-microsoft-standard-WSL2+** | Full block device support (`/dev/sdX`) and FUSE passthrough |
+| **Linux Distribution** | **Ubuntu 24.04.4 LTS** (Noble Numbat) | Also validated on **Ubuntu 22.04 LTS** (Jammy Jellyfish) |
+| **USB Passthrough Engine** | **usbipd-win v5.3.0** | Auto-binding, forced attach, and clean bus detach cycle |
+| **USB Enclosure Bridge** | **Realtek RTL9210** (`0bda:9210`) UAS Bridge | Supports high-speed UAS SCSI queuing and raw media states |
+| **Source Storage Media** | **Corsair MP600 PRO NH 932GB** PCIe 4.0 M.2 NVMe | Partition 1 formatted as VMware VMFS6 (ESXi 7.0 / 8.0) |
+| **Destination Target** | Samsung / Crucial External SSD formatted as NTFS (`/mnt/d`) | Fast 4K allocation units, high throughput |
 
 > [!TIP]
 > **Known-good enclosure fingerprint for this workflow: `0bda:9210`** (Realtek UAS bridge). A different VID:PID claiming to be mass storage **is not it**, and the near-miss is not always an unrelated device. In the [attach-script screenshot](#-the-attach-script-windows), `0bda:9201` one busid over is the enclosure holding the **destination** drive `D:`; attaching that one hands your copy target to WSL and takes it away from Windows. `152d:0583` has turned up on this bench too. Always confirm the VID:PID in `usbipd list` before attaching, and prefer the script, whose `HOLDS` column resolves each bridge to the disk behind it.

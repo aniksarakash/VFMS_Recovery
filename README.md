@@ -234,6 +234,7 @@ sudo mkdir -p /mnt/vmfs && sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs   # sdX drifts, r
 [`vmfs-attach.ps1`](vmfs-attach.ps1) covers the half of the job the copier structurally cannot. `vmfs-copy.sh` runs **inside** WSL, and from in there it has no way to offline a Windows disk or bind a USB device to itself: `diskpart` and `usbipd` are Windows executables that need an elevated Windows shell. Those steps were manual, and a forgotten one looks exactly like an empty datastore.
 
 ```powershell
+.\vmfs-attach.ps1                 # interactive graphical dashboard with all options
 .\vmfs-attach.ps1 -Mount          # offline the disk, attach to WSL, mount VMFS6
 .\vmfs-attach.ps1 -Mount -Inspect # mount and inspect datastore contents and sizes with visual effects
 .\vmfs-attach.ps1 -Inspect        # view datastore contents, VM configs, and copy commands
@@ -951,6 +952,7 @@ The copy then starts from zero, which is correct, because there is nothing on th
 | Flag | Default | Does |
 |---|---|---|
 | `-Mount` | off | Also mount the datastore with `vmfs6-fuse` after attaching |
+| `-Menu` | off | Force launch interactive action suite dashboard |
 | `-Inspect` | off | Select and view datastore contents, VM configs & sizes with visual effects |
 | `-Test` | off | Run comprehensive VMFS6 filesystem health, allocation & descriptor integrity test |
 | `-Cycle` | off | Full cycle: unmount, detach enclosure, re-attach to WSL, mount & test filesystem |

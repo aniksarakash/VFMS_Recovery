@@ -17,17 +17,21 @@
 #   .\vmfs-attach.ps1 -Mount               # also mount VMFS6 inside WSL
 #   .\vmfs-attach.ps1 -Mount -Inspect      # mount + select & view contents with visual effects
 #   .\vmfs-attach.ps1 -Inspect             # select and view datastore contents & VM details
+#   .\vmfs-attach.ps1                      # interactive command-line dashboard with all options
+#   .\vmfs-attach.ps1 -Mount               # detect + offline + attach + mount VMFS6
+#   .\vmfs-attach.ps1 -Mount -Inspect      # mount + select & view contents with visual effects
+#   .\vmfs-attach.ps1 -Inspect             # select and view datastore contents & VM details
+#   .\vmfs-attach.ps1 -Test                # verify VMFS6 filesystem health, metadata & readability
+#   .\vmfs-attach.ps1 -Cycle               # full cycle: unmount, detach, re-attach, mount & test
+#   .\vmfs-attach.ps1 -Detach              # reverse it: unmount, detach, online (with re-test option)
+#   .\vmfs-attach.ps1 -Detach -Test        # detach and immediately re-attach to test filesystem
 #   .\vmfs-attach.ps1 -BusId 1-7 -Mount -Yes
 #   .\vmfs-attach.ps1 -DiskNumber 1 -Mount
 #   .\vmfs-attach.ps1 -DryRun              # show the plan, change nothing
-#   .\vmfs-attach.ps1 -Detach              # reverse it: unmount, detach, online (with re-test option)
-#   .\vmfs-attach.ps1 -Detach -Test        # detach and immediately re-attach to test filesystem
-#   .\vmfs-attach.ps1 -Cycle               # full cycle: unmount, detach, re-attach, mount & test
-#   .\vmfs-attach.ps1 -Test                # verify VMFS6 filesystem health, metadata & readability
 #
-# Must run in an ADMINISTRATOR PowerShell. Offlining a disk and binding a USB
-# device are both privileged operations. -DryRun and -Test/-Inspect on an already-mounted
-# datastore are the exceptions: they only read, so they can run without elevation.
+# Must run in an ADMINISTRATOR PowerShell for drive offlining and USB passthrough.
+# -DryRun and -Test/-Inspect on an already-mounted datastore can run without elevation.
+# Running .\vmfs-attach.ps1 with no arguments presents the full interactive action dashboard.
 #===============================================================================
 [CmdletBinding()]
 param(
@@ -44,6 +48,8 @@ param(
   [switch] $Cycle,                      # full cycle: unmount, detach, re-attach, mount & test
   [Alias('View', 'Tree', 'Browse')]
   [switch] $Inspect,                    # select and view contents and sizes with visual effects
+  [Alias('Interactive', 'Dashboard')]
+  [switch] $Menu,                       # display interactive graphical dashboard
   [string] $SelectVm,                   # target a specific VM folder for detailed inspection
   [switch] $Yes,                        # no prompts
   [switch] $DryRun,                     # print actions, execute none
@@ -58,9 +64,11 @@ $ErrorActionPreference = 'Continue'
 $ESC   = [char]27
 $RS   = "$ESC[0m"; $BD = "$ESC[1m"; $DIM = "$ESC[2m"
 $RD  = "$ESC[31m"; $GR = "$ESC[32m"; $YL = "$ESC[33m"; $CY = "$ESC[36m"; $MG = "$ESC[35m"; $WH = "$ESC[37m"
+$BR_RD = "$ESC[91m"; $BR_GR = "$ESC[92m"; $BR_YL = "$ESC[93m"; $BR_CY = "$ESC[96m"; $BR_MG = "$ESC[95m"; $BR_WH = "$ESC[97m"
 
 if ([Console]::IsOutputRedirected -or $env:NO_COLOR -or -not $Host.UI.SupportsVirtualTerminal) {
   $RS = ''; $BD = ''; $DIM = ''; $RD = ''; $GR = ''; $YL = ''; $CY = ''; $MG = ''; $WH = ''
+  $BR_RD = ''; $BR_GR = ''; $BR_YL = ''; $BR_CY = ''; $BR_MG = ''; $BR_WH = ''
 }
 
 function Hr   { Write-Host "$DIM------------------------------------------------------------------------$RS" }
@@ -149,7 +157,7 @@ function Wsl ([string] $Cmd) {
   $a = @()
   if ($Distro) { $a += @('-d', $Distro) }
   $a += @('-u', 'root', '--', 'bash', '-lc', $Cmd)
-  return (& wsl.exe @a 2>&1)
+  return ($null | & wsl.exe @a 2>&1)
 }
 
 function WslScript ([string] $Script) {
@@ -161,7 +169,7 @@ function WslScript ([string] $Script) {
     $a = @()
     if ($Distro) { $a += @('-d', $Distro) }
     $a += @('-u', 'root', '--', 'bash', $lin)
-    return (& wsl.exe @a 2>&1)
+    return ($null | & wsl.exe @a 2>&1)
   } finally { Remove-Item $tmp -ErrorAction SilentlyContinue }
 }
 
@@ -964,6 +972,138 @@ PYEOF
     }
     Write-Host ''
     return $false
+  }
+}
+
+#------------------------------------------------------------------------------
+# Interactive Action Suite Dashboard
+#------------------------------------------------------------------------------
+function Show-InteractiveMenu {
+  $me = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+  $isElevated = $me.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+  $privBadge = if ($isElevated) { "$GR● Elevated$RS $DIM(Administrator)$RS" } else { "$YL○ Standard User$RS $DIM(Read-only / Inspect mode)$RS" }
+
+  $wslOk = $false
+  if (Get-Command wsl -ErrorAction SilentlyContinue) {
+    $wprobe = Wsl "echo wsl-ok 2>/dev/null"
+    if ("$wprobe" -match 'wsl-ok') { $wslOk = $true }
+  }
+  $wslBadge = if ($wslOk) { "$GR● Online & Reachable$RS" } else { "$RD● Not Responding (run 'wsl --shutdown')$RS" }
+
+  $encDesc = "$DIM○ None detected$RS"
+  $encs = @()
+  try { $encs = @(Get-Enclosure) } catch {}
+  $attEnc = @($encs | Where-Object { $_.State -eq 'Attached' -and $_.IsMass })
+  if ($attEnc.Count -gt 0) {
+    $encDesc = "$GR● Attached to WSL$RS $BD$($attEnc[0].BusId)$RS $DIM($($attEnc[0].Device))$RS"
+  } else {
+    $massEnc = @($encs | Where-Object { $_.IsMass })
+    if ($massEnc.Count -gt 0) {
+      $encDesc = "$YL○ In Windows$RS $BD$($massEnc[0].BusId)$RS $DIM($($massEnc[0].Device))$RS"
+    }
+  }
+
+  $mState = Get-MountState $Src
+  $mountBadge = switch ($mState) {
+    'LIVE'  { "$GR● Live Mount$RS $BD$Src$RS $DIM(vmfs6-fuse)$RS" }
+    'STALE' { "$RD● Stale Mount$RS $DIM(mount left behind)$RS" }
+    default { "$DIM○ Not Mounted$RS" }
+  }
+
+  Write-Host ''
+  Write-Host "  $BR_CY╔══════════════════════════════════════════════════════════════════════════════════════╗$RS"
+  Write-Host "  $BR_CY║$RS  $BR_WH$BD⚡ VMFS6 RECOVERY & DATASTORE MANAGEMENT SUITE$RS$BR_CY                                    ║$RS"
+  Write-Host "  $BR_CY║$RS  $DIM VMware VMFS6 · USB Enclosure Passthrough · Datastore Mounting & Diagnostics$RS$BR_CY      ║$RS"
+  Write-Host "  $BR_CY╚══════════════════════════════════════════════════════════════════════════════════════╝$RS"
+  Write-Host ''
+  Write-Host "  $BD┌─ SYSTEM & HARDWARE STATUS ────────────────────────────────────────────────────────┐$RS"
+  Write-Host "  $BD│$RS  PowerShell   : $privBadge"
+  Write-Host "  $BD│$RS  WSL2 Kernel  : $wslBadge"
+  Write-Host "  $BD│$RS  USB Enclosure: $encDesc"
+  Write-Host "  $BD│$RS  VMFS Mount   : $mountBadge"
+  Write-Host "  $BD└───────────────────────────────────────────────────────────────────────────────────┘$RS"
+  Write-Host ''
+  Write-Host "  $BD┌─ AVAILABLE ACTIONS ───────────────────────────────────────────────────────────────┐$RS"
+  Write-Host "  $BD│$RS  $CY$BD[1]$RS  $GR$BD🔌 Attach & Mount Datastore$RS                                                    $BD│$RS"
+  Write-Host "  $BD│$RS      $DIM Detect enclosure, take offline in Windows, attach to WSL, and mount VMFS6$RS   $BD│$RS"
+  Write-Host "  $BD│$RS                                                                                 $BD│$RS"
+  Write-Host "  $BD│$RS  $CY$BD[2]$RS  $GR$BD🔍 Attach, Mount & Inspect$RS                                                     $BD│$RS"
+  Write-Host "  $BD│$RS      $DIM Full attach + mount + launch interactive visual Datastore Tree & VM cards$RS  $BD│$RS"
+  Write-Host "  $BD│$RS                                                                                 $BD│$RS"
+  Write-Host "  $BD│$RS  $CY$BD[3]$RS  $BR_YL$BD🩺 Test Filesystem Health & Integrity$RS                                          $BD│$RS"
+  Write-Host "  $BD│$RS      $DIM Verify volume headers, .sf allocation, directory inodes & extent I/O$RS        $BD│$RS"
+  Write-Host "  $BD│$RS                                                                                 $BD│$RS"
+  Write-Host "  $BD│$RS  $CY$BD[4]$RS  $BR_MG$BD🔄 Cycle / Reattach & Test$RS                                                     $BD│$RS"
+  Write-Host "  $BD│$RS      $DIM Cleanly detach drive, settle USB bus, re-attach to WSL, and test filesystem$RS $BD│$RS"
+  Write-Host "  $BD│$RS                                                                                 $BD│$RS"
+  Write-Host "  $BD│$RS  $CY$BD[5]$RS  $BR_CY$BD📁 Browse Datastore Tree & VM Configs$RS                                          $BD│$RS"
+  Write-Host "  $BD│$RS      $DIM Select VM folders, inspect vCPU/RAM badges, disk sizes & copy commands$RS      $BD│$RS"
+  Write-Host "  $BD│$RS                                                                                 $BD│$RS"
+  Write-Host "  $BD│$RS  $CY$BD[6]$RS  $BR_RD$BD⏹️  Detach Drive Cleanly$RS                                                        $BD│$RS"
+  Write-Host "  $BD│$RS      $DIM Unmount from WSL, detach usbipd, and bring disk back online in Windows$RS      $BD│$RS"
+  Write-Host "  $BD│$RS                                                                                 $BD│$RS"
+  Write-Host "  $BD│$RS  $CY$BD[7]$RS  $BR_WH$BD📋 Dry-Run Simulation$RS                                                          $BD│$RS"
+  Write-Host "  $BD│$RS      $DIM Preview complete execution plan and commands without making changes$RS         $BD│$RS"
+  Write-Host "  $BD│$RS                                                                                 $BD│$RS"
+  Write-Host "  $BD│$RS  $CY$BD[Q]$RS  $DIM🚪 Exit$RS                                                                          $BD│$RS"
+  Write-Host "  $BD└───────────────────────────────────────────────────────────────────────────────────┘$RS"
+  Write-Host ''
+
+  $defaultChoice = if ($mState -eq 'LIVE') { '3' } else { '1' }
+  $c = Ask "Choose an action [1-7, Q] (default: $defaultChoice)" $defaultChoice
+  return "$c".Trim()
+}
+
+$isInteractiveInvocation = ($Menu -or (-not $Mount -and -not $Detach -and -not $Cycle -and -not $Test -and -not $Inspect -and -not $DryRun))
+
+if ($isInteractiveInvocation -and -not $Yes) {
+  $menuChoice = Show-InteractiveMenu
+  switch ($menuChoice.ToUpper()) {
+    '1' {
+      $Mount = $true
+    }
+    '2' {
+      $Mount   = $true
+      $Inspect = $true
+    }
+    '3' {
+      $Test = $true
+      $curState = Get-MountState $Src
+      if ($curState -ne 'LIVE') {
+        $Mount = $true
+      }
+    }
+    '4' {
+      $Cycle = $true
+      $Mount = $true
+      $Test  = $true
+    }
+    '5' {
+      $Inspect = $true
+      $curState = Get-MountState $Src
+      if ($curState -ne 'LIVE') {
+        $Mount = $true
+      }
+    }
+    '6' {
+      $Detach = $true
+    }
+    '7' {
+      $DryRun  = $true
+      $Mount   = $true
+      $Inspect = $true
+      $Test    = $true
+    }
+    { $_ -in 'Q', 'QUIT', 'EXIT', '0' } {
+      Write-Host ''
+      Inf "$DIMExited without making changes.$RS"
+      Write-Host ''
+      exit 0
+    }
+    default {
+      Note "Unknown choice '$menuChoice'; defaulting to Attach & Mount."
+      $Mount = $true
+    }
   }
 }
 

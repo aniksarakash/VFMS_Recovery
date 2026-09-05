@@ -237,8 +237,11 @@ sudo mkdir -p /mnt/vmfs && sudo vmfs6-fuse /dev/sdd1 /mnt/vmfs   # sdX drifts, r
 .\vmfs-attach.ps1 -Mount          # offline the disk, attach to WSL, mount VMFS6
 .\vmfs-attach.ps1 -Mount -Inspect # mount and inspect datastore contents and sizes with visual effects
 .\vmfs-attach.ps1 -Inspect        # view datastore contents, VM configs, and copy commands
+.\vmfs-attach.ps1 -Test           # verify VMFS6 filesystem health, metadata & readability
+.\vmfs-attach.ps1 -Cycle          # full cycle: unmount, detach, re-attach, mount & test filesystem
+.\vmfs-attach.ps1 -Detach         # unmount, detach, online (with option to re-test filesystem)
+.\vmfs-attach.ps1 -Detach -Test   # detach and immediately re-attach to test filesystem again
 .\vmfs-attach.ps1 -DryRun         # show the plan, change nothing
-.\vmfs-attach.ps1 -Detach         # unmount, detach, bring the disk back online
 ```
 
 > [!IMPORTANT]
@@ -948,7 +951,10 @@ The copy then starts from zero, which is correct, because there is nothing on th
 | Flag | Default | Does |
 |---|---|---|
 | `-Mount` | off | Also mount the datastore with `vmfs6-fuse` after attaching |
-| `-Detach` | off | Reverse everything: unmount, `usbipd detach`, bring the disk online |
+| `-Inspect` | off | Select and view datastore contents, VM configs & sizes with visual effects |
+| `-Test` | off | Run comprehensive VMFS6 filesystem health, allocation & descriptor integrity test |
+| `-Cycle` | off | Full cycle: unmount, detach enclosure, re-attach to WSL, mount & test filesystem |
+| `-Detach` | off | Reverse everything: unmount, `usbipd detach`, bring the disk online (with option to re-test) |
 | `-BusId <id>` | auto-detect | Skip enclosure detection, e.g. `3-2` |
 | `-DiskNumber <n>` | auto-detect | Skip disk detection, e.g. `2` |
 | `-Src <path>` | `/mnt/vmfs` | Mount point to create inside WSL |

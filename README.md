@@ -185,15 +185,88 @@ This recovery suite has been rigorously field-tested and validated end-to-end un
 
 | Environment Component | Tested Version / Specification | Notes & Validation Scope |
 | :--- | :--- | :--- |
-| **Host Operating System** | **Microsoft Windows 11 Pro** (Build `10.0.26200.0` / 24H2) | Elevated execution for `diskpart` and USB bus passthrough |
+| **Host Operating System** | **Microsoft Windows 11 Pro** (Build `10.0.26200.9168` / 24H2) | Elevated execution for `diskpart` and USB bus passthrough |
+| **WSL Platform Version** | **WSL 2.4.13.0** (WSLg 1.0.65, MSRDC 1.2.5716) | Architecture version 2 with full block device passthrough |
+| **WSL2 Linux Kernel** | **5.15.167.4-microsoft-standard-WSL2+** (`5.15.167.4-1`) | Supports SCSI direct block devices (`/dev/sdX`) and FUSE |
 | **PowerShell Runtime** | **PowerShell 7.6.5** & **7.6.1 Core** (`pwsh`) | Full UTF-8 Unicode gauges, ANSI 256-color palettes, interactive menu loops |
 | **Fallback Shell** | Windows PowerShell 5.1 (`powershell.exe`) | Supported with degraded ASCII banners and standard text prompts |
-| **WSL2 Linux Kernel** | **5.15.167.4-microsoft-standard-WSL2+** | Full block device support (`/dev/sdX`) and FUSE passthrough |
 | **Linux Distribution** | **Ubuntu 24.04.4 LTS** (Noble Numbat) | Also validated on **Ubuntu 22.04 LTS** (Jammy Jellyfish) |
 | **USB Passthrough Engine** | **usbipd-win v5.3.0** | Auto-binding, forced attach, and clean bus detach cycle |
 | **USB Enclosure Bridge** | **Realtek RTL9210** (`0bda:9210`) UAS Bridge | Supports high-speed UAS SCSI queuing and raw media states |
 | **Source Storage Media** | **Corsair MP600 PRO NH 932GB** PCIe 4.0 M.2 NVMe | Partition 1 formatted as VMware VMFS6 (ESXi 7.0 / 8.0) |
 | **Destination Target** | Samsung / Crucial External SSD formatted as NTFS (`/mnt/d`) | Fast 4K allocation units, high throughput |
+
+---
+
+### 🆕 Complete Setup on a Fresh Windows Installation (Zero to Ready)
+
+If setting up on a brand-new Windows 10 or 11 installation, follow this step-by-step setup to enable virtualization, install WSL2, configure PowerShell 7, and pull in all required tools.
+
+#### Step 1: Verify Hardware Virtualization in BIOS/UEFI
+Before booting Windows, ensure CPU virtualization is enabled in your motherboard firmware:
+* **Intel**: Enable **Intel Virtualization Technology (VT-x)**.
+* **AMD**: Enable **SVM Mode (Secure Virtual Machine)**.
+* *(In Windows Task Manager → Performance tab → CPU: confirm "Virtualization: Enabled" appears at the bottom right).*
+
+#### Step 2: Enable WSL2 & Install Ubuntu 24.04 (Administrator PowerShell)
+Open **PowerShell** as **Administrator** (`Win + X` → Terminal/PowerShell as Admin) and execute:
+
+```powershell
+# 1. Enable Virtual Machine Platform and Windows Subsystem for Linux, then install Ubuntu 24.04
+wsl --install -d Ubuntu-24.04
+
+# 2. If already installed on an older build, ensure WSL is set to version 2 and updated:
+wsl --set-default-version 2
+wsl --update
+```
+
+> [!NOTE]
+> If Windows prompts to restart, reboot your computer (`Restart-Computer`). Upon reboot, Ubuntu will launch automatically to prompt for a default UNIX username and password.
+
+#### Step 3: Install PowerShell 7 & usbipd-win via WinGet
+In the same **Administrator PowerShell** console:
+
+```powershell
+# 1. Install modern PowerShell 7.6+ (pwsh)
+winget install --id Microsoft.PowerShell --source winget --accept-package-agreements --accept-source-agreements
+
+# 2. Install usbipd-win (v5.3+) for USB enclosure passthrough
+winget install --id dorssel.usbipd-win --source winget --accept-package-agreements --accept-source-agreements
+
+# 3. Allow execution of local recovery scripts
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser -Force
+```
+
+Close the current console and launch **PowerShell 7 (`pwsh`) as Administrator** for all subsequent steps.
+
+#### Step 4: Install Linux Packages Inside WSL2 / Ubuntu
+Open your Ubuntu shell by typing `wsl` in your terminal, and run:
+
+```bash
+# 1. Update package lists
+sudo apt update && sudo apt upgrade -y
+
+# 2. Install VMFS6 FUSE, ddrescue, rsync, hex viewer, and USB/IP client utilities
+sudo apt install -y vmfs6-tools gddrescue rsync xxd linux-tools-virtual hwdata
+
+# 3. Register the usbip command link (if not already aliased by the package)
+sudo update-alternatives --install /usr/local/bin/usbip usbip $(ls /usr/lib/linux-tools/*/usbip 2>/dev/null | tail -n1) 20 2>/dev/null || true
+
+# 4. Exit back to Windows PowerShell
+exit
+```
+
+#### Step 5: Verify Your Setup & Start Recovery
+In your Administrator **PowerShell 7** session, clone this repository and launch the interactive suite:
+
+```powershell
+# Clone the recovery repository
+git clone https://github.com/aniksarakash/VFMS_Recovery.git
+cd VFMS_Recovery
+
+# Launch the interactive menu dashboard
+.\vmfs-attach.ps1
+```
 
 > [!TIP]
 > **Known-good enclosure fingerprint for this workflow: `0bda:9210`** (Realtek UAS bridge). A different VID:PID claiming to be mass storage **is not it**, and the near-miss is not always an unrelated device. In the [attach-script screenshot](#-the-attach-script-windows), `0bda:9201` one busid over is the enclosure holding the **destination** drive `D:`; attaching that one hands your copy target to WSL and takes it away from Windows. `152d:0583` has turned up on this bench too. Always confirm the VID:PID in `usbipd list` before attaching, and prefer the script, whose `HOLDS` column resolves each bridge to the disk behind it.

@@ -81,7 +81,7 @@ function Die  ($m) {
   Write-Host ''
   if ($script:menuLoop) {
     Return-OrExit 1
-    throw [System.Management.Automation.PipelineStoppedException]::new()
+    throw [System.OperationCanceledException]::new($m)
   } else {
     exit 1
   }
@@ -1607,8 +1607,24 @@ if ($dev.State -eq 'Not shared') {
 if ($dev.State -eq 'Attached') {
   Ok "$BusId is already attached to WSL."
 } else {
-  if (-not (Invoke-Step "usbipd attach --wsl --busid $BusId" { & usbipd attach --wsl --busid $BusId })) {
-    Die 'attach failed. If it reports the device is in use, the disk is not fully offline.'
+  $wslKeepAlive = $null
+  if (-not $DryRun) {
+    try {
+      $wslArgs = @()
+      if ($Distro) { $wslArgs += @('-d', $Distro) }
+      $wslArgs += @('-u', 'root', '--', 'sleep', '30')
+      $wslKeepAlive = Start-Process -FilePath 'wsl.exe' -ArgumentList $wslArgs -WindowStyle Hidden -PassThru
+      Start-Sleep -Milliseconds 300
+    } catch {}
+  }
+  try {
+    if (-not (Invoke-Step "usbipd attach --wsl --busid $BusId" { & usbipd attach --wsl --busid $BusId })) {
+      Die 'attach failed. If it reports the device is in use, the disk is not fully offline.'
+    }
+  } finally {
+    if ($wslKeepAlive -and -not $wslKeepAlive.HasExited) {
+      Stop-Process -Id $wslKeepAlive.Id -Force -ErrorAction SilentlyContinue
+    }
   }
   $att = Wait-For -Label "usbipd reports $BusId Attached" -Seconds $TimeoutSec -Test {
     $d2 = Get-Enclosure | Where-Object { $_.BusId -eq $BusId }
@@ -1876,7 +1892,11 @@ Inf "     $DIM .\vmfs-attach.ps1 -Detach$RS"
 Write-Host ''
 
   Return-OrExit 0
-  } catch [System.Management.Automation.PipelineStoppedException] {
+  } catch [System.OperationCanceledException] {
+    continue menuLoop
+  } catch {
+    Bad "Unexpected error: $($_.Exception.Message)"
+    Return-OrExit 1
     continue menuLoop
   }
   if (-not $script:menuLoop) { break }

@@ -12,6 +12,7 @@
 #   ./vmfs-copy.sh                          # interactive menu & dashboard
 #   ./vmfs-copy.sh --all --yes              # copy everything, no prompts
 #   ./vmfs-copy.sh --src /mnt/vmfs --dest /mnt/d
+#   ./vmfs-copy.sh --vm "VM_Folder"         # copy only this VM
 #   ./vmfs-copy.sh --dry-run                # show the plan, copy nothing
 #   ./vmfs-copy.sh --no-ddrescue            # rsync everything (faster, no retry)
 #   ./vmfs-copy.sh --big-mb 512             # ddrescue threshold
@@ -31,6 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #------------------------------------------------------------------------------
 SRC="/mnt/vmfs"                   # where vmfs6-fuse mounted the datastore
 DEST="/mnt/d"                     # destination drive
+TARGET_VM=""                      # specific VM folder to target (optional)
 MAPDIR=""                         # ddrescue mapfiles + logs; default <DEST>/.vmfs-recovery
 BIG_MB=1024                       # files >= this many MB go through ddrescue
 ASSUME_ALL=0
@@ -45,7 +47,7 @@ BAR_W=38
 #------------------------------------------------------------------------------
 # Arg parsing
 #------------------------------------------------------------------------------
-usage() { sed -n '2,22p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0; }
+usage() { sed -n '2,23p' "$0" | sed 's/^#\{1,\} \{0,1\}//'; exit 0; }
 
 ORIG_ARGS=("$@")
 
@@ -53,6 +55,7 @@ while (($#)); do
   case $1 in
     --src)          SRC=${2:?missing value}; shift 2 ;;
     --dest)         DEST=${2:?missing value}; shift 2 ;;
+    --vm|--target)  TARGET_VM=${2:?missing value}; shift 2 ;;
     --mapdir)       MAPDIR=${2:?missing value}; shift 2 ;;
     --big-mb)       BIG_MB=${2:?missing value}; shift 2 ;;
     --all|-a)       ASSUME_ALL=1; shift ;;
@@ -212,6 +215,20 @@ check_environment_prereqs() {
   return 0
 }
 
+# Auto-detect if --src was passed pointing directly to an individual VM directory
+check_single_vm_target() {
+  if [[ -d "$SRC" ]]; then
+    local has_vm_files has_subdirs
+    has_vm_files=$($SUDO find "$SRC" -maxdepth 1 -type f \( -name '*.vmdk' -o -name '*.vmx' \) 2>/dev/null | head -1)
+    has_subdirs=$($SUDO find "$SRC" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+    if [[ -n $has_vm_files && -z $has_subdirs ]]; then
+      TARGET_VM="$(basename "$SRC")"
+      SRC="$(dirname "$SRC")"
+      ok "Auto-detected direct VM directory. Datastore root set to '${CY}${SRC}${R}', target VM set to '${CY}${TARGET_VM}${R}'"
+    fi
+  fi
+}
+
 # Attach runbook guidance when datastore is unmounted
 attach_help() {
   printf '\n  %s\n' "${B}The datastore must be attached and mounted before copying:${R}"
@@ -300,6 +317,9 @@ show_environment_card() {
   printf '  %s├────────────────────────────────────────────────────────────────────────┤%s\n' "$BD" "$R"
   printf '  %s│%s  Source VMFS:      %-35b  %s│%s\n' "$BD" "$R" "$src_st" "$BD" "$R"
   printf '  %s│%s    Location:       %-53s %s│%s\n' "$BD" "$R" "$SRC" "$BD" "$R"
+  if [[ -n $TARGET_VM ]]; then
+    printf '  %s│%s    Target VM:      %-53s %s│%s\n' "$BD" "$R" "$TARGET_VM" "$BD" "$R"
+  fi
   printf '  %s│%s    Details:        %-53.53s %s│%s\n' "$BD" "$R" "$src_detail" "$BD" "$R"
   printf '  %s│%s  Destination:      %-53s %s│%s\n' "$BD" "$R" "$DEST" "$BD" "$R"
   printf '  %s│%s    Free Space:     %-20s %-32b %s│%s\n' "$BD" "$R" "$(human "$d_free") available" "$gauge_str" "$BD" "$R"
@@ -358,14 +378,32 @@ scan_datastore() {
   printf '\033[?25l'
 
   local tmp_list; tmp_list=$(mktemp)
-  ($SUDO find "$SRC" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z > "$tmp_list") &
-  local fpid=$!
-  while kill -0 "$fpid" 2>/dev/null; do
-    printf '\r  %s%s%s Scanning %s%s%s ...\033[K' "$CY" "${spin_chars[i]}" "$R" "$B" "$SRC" "$R"
-    i=$(( (i + 1) % 10 ))
-    sleep 0.08
-  done
-  wait "$fpid"
+  if [[ -n $TARGET_VM ]]; then
+    if [[ -d "$SRC/$TARGET_VM" ]]; then
+      printf '%s\0' "$SRC/$TARGET_VM" > "$tmp_list"
+    else
+      local match
+      match=$($SUDO find "$SRC" -mindepth 1 -maxdepth 1 -type d -iname "*$TARGET_VM*" 2>/dev/null | head -n 1)
+      if [[ -n $match ]]; then
+        TARGET_VM=$(basename "$match")
+        printf '%s\0' "$match" > "$tmp_list"
+      else
+        warn "Target VM '$TARGET_VM' not found in '$SRC'."
+        rm -f "$tmp_list"
+        printf '\033[?25h'
+        return 1
+      fi
+    fi
+  else
+    ($SUDO find "$SRC" -mindepth 1 -maxdepth 1 -type d -print0 2>/dev/null | sort -z > "$tmp_list") &
+    local fpid=$!
+    while kill -0 "$fpid" 2>/dev/null; do
+      printf '\r  %s%s%s Scanning %s%s%s ...\033[K' "$CY" "${spin_chars[i]}" "$R" "$B" "$SRC" "$R"
+      i=$(( (i + 1) % 10 ))
+      sleep 0.08
+    done
+    wait "$fpid"
+  fi
 
   local dir name sz big dsz pct st
   while IFS= read -r -d '' dir; do
@@ -595,6 +633,7 @@ map_valid_for() {
   need=$(map_rescued_end "$1")
   (( need > 0 )) || return 0
   cur=$($SUDO stat -c %s -- "$2" 2>/dev/null || printf 0)
+  cur=${cur:-0}
   (( cur >= need )) && return 0
   warn "Stale mapfile ignored: ${DIM}$1${R}"
   info "    claims $(human "$need") already written here, but the destination holds $(human "${cur:-0}")."
@@ -806,8 +845,10 @@ do_interactive_selection() {
   SEL=()
   printf '\n'
   local reply=""
-  read -r -p "  Select folders [e.g. 1 3, 1-3, all, q]: " reply
-  reply=${reply:-}
+  local prompt_default="q"
+  if ((N == 1)); then prompt_default="1"; fi
+  read -r -p "  Select folders [e.g. 1 3, 1-3, all, q] (default: $prompt_default): " reply
+  reply=${reply:-$prompt_default}
   if [[ $reply == q || $reply == quit ]]; then info "Cancelled."; return 0; fi
   reply=${reply//,/ }
   for tok in $reply; do
@@ -863,10 +904,11 @@ do_dry_run() {
 #------------------------------------------------------------------------------
 show_header
 check_environment_prereqs
+check_single_vm_target
 
 # Non-interactive CLI mode: execute directly without interactive loop
 if ((!MENU_LOOP)); then
-  if ((ASSUME_ALL || DRY_RUN)); then
+  if ((ASSUME_ALL || DRY_RUN || ${#TARGET_VM})); then
     do_copy_all
     exit $?
   else

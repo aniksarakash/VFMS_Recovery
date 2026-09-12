@@ -1,4 +1,4 @@
-#===============================================================================
+﻿#===============================================================================
 # vmfs-attach.ps1 - Windows-side companion to vmfs-copy.sh
 #
 # Does the three things vmfs-copy.sh structurally cannot, because it runs on
@@ -476,6 +476,37 @@ for name in names:
             pass
         res["folders"].append(folder_info)
 
+# Calculate real physical datastore size and used space when FUSE statvfs reports dummy values
+folder_sum = sum(f["size_bytes"] for f in res["folders"])
+if res["used_bytes"] == 0 or res["total_bytes"] < folder_sum:
+    res["used_bytes"] = folder_sum
+    import glob
+    backing_dev = ""
+    for pid_dir in glob.glob("/proc/[0-9]*"):
+        try:
+            with open(os.path.join(pid_dir, "cmdline"), "rb") as cf:
+                cmd = cf.read().decode("utf-8", errors="ignore")
+                if "vmfs6-fuse" in cmd and mount_dir in cmd:
+                    for p in cmd.split("\x00"):
+                        if p.startswith("/dev/"):
+                            backing_dev = p
+                            break
+        except Exception:
+            continue
+        if backing_dev: break
+    if backing_dev:
+        dev_name = os.path.basename(backing_dev)
+        size_file = f"/sys/class/block/{dev_name}/size"
+        if os.path.exists(size_file):
+            try:
+                with open(size_file) as sf:
+                    res["total_bytes"] = int(sf.read().strip()) * 512
+            except Exception:
+                pass
+    if res["total_bytes"] < folder_sum:
+        res["total_bytes"] = folder_sum
+    res["free_bytes"] = max(0, res["total_bytes"] - res["used_bytes"])
+
 print(json.dumps(res))
 PYEOF
 "@
@@ -747,7 +778,9 @@ PYEOF
     }
     Write-Host ''
     Write-Host "  $BD Ready-to-run copy command for this VM:$RS"
-    Write-Host "     $DIM sudo ./vmfs-copy.sh --src `"$Path/$($selected.name)`" --dest $Dest$RS"
+    Write-Host "     $DIM sudo ./vmfs-copy.sh --src `"$Path`" --dest $Dest --vm `"$($selected.name)`"$RS"
+    Write-Host "  $BD Interactive menu for all VMs:$RS"
+    Write-Host "     $DIM sudo ./vmfs-copy.sh --src `"$Path`" --dest $Dest$RS"
     Write-Host ''
 
     if ($Yes -or [Console]::IsInputRedirected) { $loop = $false }

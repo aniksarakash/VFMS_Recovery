@@ -304,6 +304,24 @@ check_3_descriptor_agreement() {
     else
       warn "$n: descriptor declares $(( sec * 512 )) bytes, image holds $s"
     fi
+
+    shopt -s nullglob
+    local snap_descs=("$DEST/$n/"*-000*.vmdk)
+    shopt -u nullglob
+    for sd in "${snap_descs[@]:-}"; do
+      [[ -f $sd ]] || continue
+      local sline ssec styp sext ssz
+      sline=$(grep -m1 '^RW' "$sd" 2>/dev/null || echo "")
+      ssec=$(awk '{print $2}' <<<"$sline")
+      styp=$(awk '{print $3}' <<<"$sline")
+      sext=$(sed -e 's/^[^"]*"//' -e 's/".*$//' <<<"$sline")
+      if [[ -f "$DEST/$n/$sext" ]]; then
+        ssz=$(stat -c %s "$DEST/$n/$sext" 2>/dev/null || echo 0)
+        ok "$n: snapshot descriptor $(basename "$sd") ($styp -> $sext, $(gib "$ssz")) matches"
+      else
+        warn "$n: snapshot descriptor $(basename "$sd") declares $sext, not found under $DEST/$n"
+      fi
+    done
   done
 }
 
@@ -369,10 +387,15 @@ check_6_sizing_and_budget() {
     else
       [[ -n ${v:-} ]] && ok "$n: numvcpus $v" || bad "$n: numvcpus unset"
     fi
-    if [[ -n ${v:-} && -n ${c:-} ]] && (( v % c == 0 )); then
-      ok "$n: coresPerSocket $c divides into numvcpus $v"
+    local c_eff=${c:-1}
+    if [[ -n ${v:-} ]] && (( v % c_eff == 0 )); then
+      if [[ -n ${c:-} ]]; then
+        ok "$n: coresPerSocket $c divides into numvcpus $v"
+      else
+        ok "$n: coresPerSocket unset (defaults to 1, divides into numvcpus $v)"
+      fi
     else
-      bad "$n: coresPerSocket ${c:-unset} does not divide into ${v:-unset} - power-on fails"
+      bad "$n: coresPerSocket ${c:-1} does not divide into ${v:-unset} - power-on fails"
     fi
     total=$((total + ${m:-0}))
   done
@@ -405,14 +428,17 @@ check_7_identity() {
   for n in "${target_vms[@]}"; do
     local f; f=$(vmx_for "$DEST/$n" "$n")
     [[ -f $f ]] || continue
-    local ref=0 val
+    local ref=0 val ref_name=""
     while IFS= read -r val; do
-      [[ $val == "$n.vmdk" ]] && ref=1
+      if [[ $val == "$n.vmdk" || $val == "$n"-*.vmdk || ($val == *.vmdk && $val != /*) ]]; then
+        ref=1
+        ref_name="$val"
+      fi
     done < <(awk -F'"' '/^[a-z]+[0-9]+:[0-9]+[.]fileName = /{print $2}' "$f" 2>/dev/null)
     if (( ref )); then
-      ok "$n: disk reference is relative to its own folder"
+      ok "$n: disk reference ($ref_name) is relative to its own folder"
     else
-      bad "$n: no controller line points at $n.vmdk"
+      bad "$n: no controller line points at $n.vmdk or snapshot descriptor"
     fi
     grep -q '^uuid.bios = ' "$f" 2>/dev/null && ok "$n: uuid.bios present (Windows activation)" || bad "$n: uuid.bios missing"
     local dname

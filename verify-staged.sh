@@ -68,14 +68,29 @@ else
   B=''; DIM=''; R=''; CY=''; GR=''; YL=''; RD=''; MG=''; WH=''; BD=''
 fi
 
-PASS=0; FAIL=0; WARN=0
-reset_counts() { PASS=0; FAIL=0; WARN=0; }
+PASS=0; FAIL=0; WARN=0; INCOMPLETE=0
+reset_counts() { PASS=0; FAIL=0; WARN=0; INCOMPLETE=0; }
 ok()   { printf '  %s[ ok ]%s %s\n' "$GR" "$R" "$*"; PASS=$((PASS+1)); }
 bad()  { printf '  %s[FAIL]%s %s\n' "$RD" "$R" "$*"; FAIL=$((FAIL+1)); }
 warn() { printf '  %s[warn]%s %s\n' "$YL" "$R" "$*"; WARN=$((WARN+1)); }
 info() { printf '  %s\n' "$*"; }
 hdr()  { printf '\n%s== %s%s\n' "$CY$B" "$*" "$R"; }
 hr()   { printf '  %s\n' "${DIM}────────────────────────────────────────────────────────────────────────${R}"; }
+
+# A FUSE mount stays listed in /proc/mounts after its daemon dies or its backing
+# disk is re-enumerated, but every read then fails with ENOTCONN. Being listed
+# is therefore not evidence the source is readable, and the probe needs a time
+# limit because a wedged daemon blocks in the kernel indefinitely.
+PROBE_TIMEOUT=8
+probe() {
+  if command -v timeout >/dev/null 2>&1; then timeout "$PROBE_TIMEOUT" "$@"; else "$@"; fi
+}
+src_is_mounted() {
+  awk -v want="$1" '$2 == want { hit = 1 } END { exit !hit }' /proc/mounts 2>/dev/null
+}
+src_readable() {
+  probe ls -1 -- "$1" >/dev/null 2>&1
+}
 
 return_or_exit() {
   local code=${1:-0}
@@ -107,6 +122,13 @@ gib() {
 vmx_for() {  # $1 = folder, $2 = basename
   [[ -f "$1/$2.vmx.t130" ]] && { echo "$1/$2.vmx.t130"; return; }
   echo "$1/$2.vmx"
+}
+
+copy_in_flight() {   # $1 = folder basename; is a copier writing this VM now?
+  command -v pgrep >/dev/null 2>&1 || return 1
+  pgrep -f "ddrescue.*$1" >/dev/null 2>&1 && return 0
+  pgrep -f "rsync.*$1"    >/dev/null 2>&1 && return 0
+  return 1
 }
 
 expected_sectors() {  # $1 = folder basename
@@ -152,9 +174,13 @@ show_target_card() {
   while IFS= read -r l; do [[ -n $l ]] && vms+=("$l"); done < <(get_staged_vms)
 
   local src_st="${RD}UNMOUNTED / OFFLINE${R}"
-  if awk -v want="$SRC" '$2 == want { hit = 1 } END { exit !hit }' /proc/mounts 2>/dev/null; then
-    src_st="${GR}${B}LIVE FUSE MOUNT${R}"
-  elif [[ -d $SRC ]] && [[ -n $(ls -A "$SRC" 2>/dev/null) ]]; then
+  if src_is_mounted "$SRC"; then
+    if src_readable "$SRC"; then
+      src_st="${GR}${B}LIVE FUSE MOUNT${R}"
+    else
+      src_st="${RD}${B}STALE MOUNT (ENOTCONN)${R}"
+    fi
+  elif [[ -d $SRC ]] && [[ -n $(probe ls -A "$SRC" 2>/dev/null) ]]; then
     src_st="${YL}${B}READABLE DIRECTORY${R}"
   fi
 
@@ -228,7 +254,15 @@ check_1_image_completeness() {
       COMPLETE[$n]=1
       ok "$n: exactly $s bytes ($(gib "$s"))"
     elif (( s < exp )); then
-      warn "$n: $s of $exp bytes ($((s * 100 / exp))%) - copy still running"
+      # Short of the declared size is only benign while a copier is actually
+      # writing it. Otherwise the image is truncated - an aborted, killed or
+      # out-of-space copy - and must never be reported as merely advisory.
+      INCOMPLETE=$((INCOMPLETE + 1))
+      if copy_in_flight "$n"; then
+        warn "$n: $s of $exp bytes ($((s * 100 / exp))%) - copy still running"
+      else
+        bad "$n: TRUNCATED - $s of $exp bytes ($((s * 100 / exp))%), no copy process is running"
+      fi
     else
       bad "$n: $s bytes, larger than the $exp bytes the descriptor declares"
     fi
@@ -275,8 +309,12 @@ check_2_boot_structures() {
     fi
     if [[ $gpt == "EFI PART" ]]; then
       ok "$n: valid EFI PART GPT header"
+    elif [[ $sig == 55aa ]]; then
+      # No GPT header behind a valid 55aa boot signature means a legacy
+      # MBR/msdos disk, which is a perfectly bootable layout, not damage.
+      ok "$n: legacy MBR partitioning (no GPT header, boot signature intact)"
     elif [[ ${COMPLETE[$n]:-0} == 1 ]]; then
-      bad "$n: sector 1 reads '$gpt'"
+      bad "$n: neither an MBR signature nor a GPT header - sector 1 reads '$gpt'"
     else
       warn "$n: sector 1 reads '$gpt', but the copy is unfinished - recheck at the end"
     fi
@@ -465,7 +503,9 @@ check_8_backups() {
               && ok "$n: $(basename "$b") is byte-identical to live source" \
               || warn "$n: $(basename "$b") differs from live source vmx"
           else
-            ok "$n: preserved $(basename "$b") (source not mounted, skipped diff)"
+            # A comparison that never ran is not a pass. Say so, otherwise an
+            # unmounted or stale source turns every backup into a green tick.
+            warn "$n: preserved $(basename "$b"), but the source is not readable - diff NOT performed"
           fi ;;
         *) ok "$n: preserved $(basename "$b")" ;;
       esac
@@ -527,16 +567,20 @@ run_full_verification() {
   printf '  %s│%s  PASS: %s%-10d%s  FAIL: %s%-10d%s  WARN: %s%-10d%s           %s│%s\n' \
     "$BD" "$R" "$GR$B" "$PASS" "$R" "$RD$B" "$FAIL" "$R" "$YL$B" "$WARN" "$R" "$BD" "$R"
   printf '  %s├────────────────────────────────────────────────────────────────────────┤%s\n' "$BD" "$R"
-  if (( FAIL == 0 && WARN == 0 )); then
+  if (( FAIL == 0 && WARN == 0 && INCOMPLETE == 0 )); then
     printf '  %s│%s  STATUS: %s[ ALL CHECKS PASSED - 100%% READY FOR ESXi IMPORT ]%s            %s│%s\n' "$BD" "$R" "$GR$B" "$R" "$BD" "$R"
-  elif (( FAIL == 0 )); then
+  elif (( FAIL == 0 && INCOMPLETE == 0 )); then
     printf '  %s│%s  STATUS: %s[ NO FAILURES - REVIEW ADVISORY WARNINGS ABOVE ]%s               %s│%s\n' "$BD" "$R" "$YL$B" "$R" "$BD" "$R"
+  elif (( FAIL == 0 )); then
+    printf '  %s│%s  STATUS: %s[ %-2d IMAGE(S) INCOMPLETE - STAGING IS NOT FINISHED ]%s           %s│%s\n' "$BD" "$R" "$YL$B" "$INCOMPLETE" "$R" "$BD" "$R"
   else
     printf '  %s│%s  STATUS: %s[ FAILURES DETECTED - RESOLVE BEFORE IMPORTING TO ESXi ]%s       %s│%s\n' "$BD" "$R" "$RD$B" "$R" "$BD" "$R"
   fi
   printf '  %s└────────────────────────────────────────────────────────────────────────┘%s\n' "$BD" "$R"
 
-  ((FAIL == 0))
+  # An incomplete image must not exit 0: a wrapper or operator reading only the
+  # exit status would otherwise treat a half-copied disk as ready to import.
+  (( FAIL == 0 && INCOMPLETE == 0 ))
   return $?
 }
 

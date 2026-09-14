@@ -43,6 +43,7 @@ DRY_RUN=0
 NO_SUDO=0                         # skip sudo (already root, or source is world-readable)
 FORCE_MENU=0
 BAR_W=38
+SUDO="sudo"                       # ensure_sudo settles this once privileges are known
 
 #------------------------------------------------------------------------------
 # Arg parsing
@@ -191,6 +192,198 @@ src_is_mounted() {
   awk -v want="$1" '$2 == want { hit = 1 } END { exit !hit }' /proc/mounts 2>/dev/null
 }
 
+#------------------------------------------------------------------------------
+# Source mount health: detect, repair and mount the vmfs6-fuse datastore
+#
+# A FUSE mount outlives its daemon. When the enclosure is unplugged, power
+# cycled or re-attached through usbipd, the disk comes back under a different
+# /dev node and the old vmfs6-fuse is orphaned: /proc/mounts still lists the
+# mount, but every read returns ENOTCONN (Transport endpoint not connected).
+# Probes are time-boxed because a wedged daemon blocks in the kernel forever,
+# which would otherwise hang the dashboard rather than report a bad mount.
+#------------------------------------------------------------------------------
+PROBE_TIMEOUT=8
+
+probe() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$PROBE_TIMEOUT" "$@"
+  else
+    "$@"
+  fi
+}
+
+src_readable() {
+  probe $SUDO ls -1 -- "$1" >/dev/null 2>&1
+}
+
+mount_state() {   # LIVE | STALE | FREE
+  local p=${1:-$SRC}
+  if src_is_mounted "$p"; then
+    if src_readable "$p"; then printf 'LIVE\n'; else printf 'STALE\n'; fi
+  else
+    printf 'FREE\n'
+  fi
+}
+
+dev_size() {
+  local n=${1#/dev/} f
+  f="/sys/class/block/$n/size"
+  if [[ -r $f ]]; then
+    printf '%s' "$(( $(cat "$f") * 512 ))"
+  else
+    $SUDO blockdev --getsize64 "$1" 2>/dev/null || printf '0'
+  fi
+}
+
+# Every partition ESXi tagged as a VMFS volume member, largest first. An ESXi
+# system disk carries two: the small one is OSDATA, the large one is the
+# datastore, so size is what tells them apart.
+vmfs_candidates() {
+  local line name size out=''
+  while IFS= read -r line; do
+    [[ $line == *'FSTYPE="VMFS_volume_member"'* ]] || continue
+    [[ $line =~ NAME=\"([^\"]+)\" ]] || continue
+    name=${BASH_REMATCH[1]}
+    size=0
+    [[ $line =~ SIZE=\"([0-9]+)\" ]] && size=${BASH_REMATCH[1]}
+    out+="$size /dev/$name"$'\n'
+  done < <($SUDO lsblk -b -P -o NAME,SIZE,FSTYPE,TYPE 2>/dev/null)
+
+  if [[ -z $out ]]; then
+    while IFS= read -r name; do
+      [[ -b $name ]] || continue
+      out+="$(dev_size "$name") $name"$'\n'
+    done < <($SUDO blkid -t TYPE=VMFS_volume_member -o device 2>/dev/null)
+  fi
+
+  [[ -n $out ]] || return 1
+  printf '%s' "$out" | sort -rn
+}
+
+detect_vmfs_device() {
+  local first
+  first=$(vmfs_candidates | head -n1)
+  [[ -n $first ]] || return 1
+  printf '%s\n' "${first#* }"
+}
+
+# PIDs of vmfs6-fuse daemons serving exactly this mount point. Matching whole
+# argv entries keeps the path out of a regex and never touches a daemon that
+# is serving a different datastore.
+fuse_pids_for() {
+  local p=$1 d args
+  for d in /proc/[0-9]*; do
+    [[ -r "$d/cmdline" ]] || continue
+    args=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null) || continue
+    [[ $args == *vmfs*fuse* ]] || continue
+    printf '%s\n' "$args" | grep -qxF -- "$p" || continue
+    printf '%s\n' "${d#/proc/}"
+  done
+}
+
+clear_stale_mount() {
+  local p=$1 pid
+  for pid in $(fuse_pids_for "$p"); do $SUDO kill "$pid" 2>/dev/null; done
+  sleep 1
+  for pid in $(fuse_pids_for "$p"); do $SUDO kill -9 "$pid" 2>/dev/null; done
+
+  probe $SUDO fusermount -u -- "$p" 2>/dev/null \
+    || probe $SUDO fusermount -uz -- "$p" 2>/dev/null \
+    || probe $SUDO umount -l -- "$p" 2>/dev/null \
+    || probe $SUDO umount -f -- "$p" 2>/dev/null \
+    || true
+
+  $SUDO mkdir -p -- "$p" 2>/dev/null || true
+  [[ $(mount_state "$p") == FREE ]]
+}
+
+mount_vmfs_source() {
+  local dev=$1 p=$2 out i line
+  $SUDO mkdir -p -- "$p" 2>/dev/null || true
+  out=$($SUDO vmfs6-fuse "$dev" "$p" 2>&1)
+  for ((i = 0; i < 20; i++)); do
+    [[ $(mount_state "$p") == LIVE ]] && return 0
+    sleep 0.5
+  done
+  if [[ -n $out ]]; then
+    while IFS= read -r line; do
+      [[ -n $line ]] && info "    ${DIM}${line}${R}"
+    done <<<"$out"
+  fi
+  return 1
+}
+
+confirm() {   # $1 prompt  $2 default (y|n)
+  local prompt=$1 def=${2:-y} ans=''
+  if ((ASSUME_YES)) || [[ ! -t 0 ]]; then
+    [[ $def == y ]]
+    return
+  fi
+  read -r -p "  $prompt " ans
+  ans=${ans:-$def}
+  [[ $ans =~ ^[yY] ]]
+}
+
+# Bring $SRC to a readable state, repairing or mounting it as needed.
+ensure_source_ready() {
+  local state dev n
+
+  state=$(mount_state "$SRC")
+
+  if [[ $state == STALE ]]; then
+    warn "Source '$SRC' is listed in /proc/mounts but every read fails (stale FUSE endpoint)."
+    info "    ${DIM}The enclosure was unplugged, power cycled or re-attached, so the disk${R}"
+    info "    ${DIM}came back on a different /dev node and the old vmfs6-fuse is orphaned.${R}"
+    if ! command -v vmfs6-fuse >/dev/null 2>&1; then
+      err "vmfs6-fuse is not installed, so the mount cannot be repaired: sudo apt install vmfs6-tools"
+      return 1
+    fi
+    info "  Clearing the orphaned mount ..."
+    if ! clear_stale_mount "$SRC"; then
+      err "Could not clear the stale mount at '$SRC'. Force it off, then rerun:"
+      err "  sudo umount -l '$SRC'"
+      return 1
+    fi
+    ok "Stale mount cleared."
+    state=FREE
+  fi
+
+  if [[ $state == FREE ]]; then
+    dev=$(detect_vmfs_device) || dev=''
+    if [[ -z $dev ]]; then
+      warn "Source '$SRC' is not mounted, and no VMFS partition is visible in WSL."
+      attach_help
+      return 1
+    fi
+    if ! command -v vmfs6-fuse >/dev/null 2>&1; then
+      err "vmfs6-fuse is not installed: sudo apt install vmfs6-tools"
+      return 1
+    fi
+    info "Detected VMFS datastore: ${CY}${dev}${R} ${DIM}($(human "$(dev_size "$dev")"))${R}"
+    n=$(vmfs_candidates | wc -l | tr -d ' ')
+    if ((n > 1)); then
+      info "    ${DIM}$n VMFS partitions present, using the largest. The smaller is ESXi OSDATA.${R}"
+      while read -r size cand; do
+        info "      ${DIM}${cand}  $(human "$size")${R}"
+      done < <(vmfs_candidates)
+    fi
+    if ! confirm "Mount it read-only at '$SRC' now? [Y/n]:" y; then
+      attach_help
+      return 1
+    fi
+    if ! mount_vmfs_source "$dev" "$SRC"; then
+      err "Mounting $dev at '$SRC' failed."
+      attach_help
+      return 1
+    fi
+    ok "Mounted ${CY}${dev}${R} at ${CY}${SRC}${R} (read-only)."
+  fi
+
+  src_readable "$SRC" && return 0
+  err "Source '$SRC' is mounted but still unreadable."
+  return 1
+}
+
 check_environment_prereqs() {
   ensure_sudo || return 1
 
@@ -203,10 +396,29 @@ check_environment_prereqs() {
     USE_DDRESCUE=0
   fi
 
-  [[ -d $DEST ]] || {
-    err "Destination '$DEST' does not exist. Mount it first: sudo mkdir -p $DEST && sudo mount -t drvfs D: $DEST"
+  local dest_ok=1
+  if ! $SUDO ls -d "$DEST" >/dev/null 2>&1 || ! df -B1 "$DEST" >/dev/null 2>&1; then
+    dest_ok=0
+  fi
+
+  if ((!dest_ok)); then
+    if [[ $DEST =~ ^/mnt/([a-zA-Z])(/.*)?$ ]]; then
+      local dletter="${BASH_REMATCH[1]^^}:"
+      warn "Destination '$DEST' is inaccessible or disconnected. Attempting auto-remount of $dletter ..."
+      $SUDO umount -l "$DEST" 2>/dev/null || true
+      $SUDO mkdir -p "$DEST" 2>/dev/null || true
+      $SUDO mount -t drvfs "$dletter" "$DEST" 2>/dev/null || true
+      if $SUDO ls -d "$DEST" >/dev/null 2>&1 && df -B1 "$DEST" >/dev/null 2>&1; then
+        ok "Destination '$DEST' ($dletter) successfully remounted."
+        dest_ok=1
+      fi
+    fi
+  fi
+
+  if ((!dest_ok)); then
+    err "Destination '$DEST' does not exist or is inaccessible. Mount it first: sudo mkdir -p $DEST && sudo mount -t drvfs D: $DEST"
     return 1
-  }
+  fi
 
   mkdir -p "$MAPDIR" 2>/dev/null || $SUDO mkdir -p "$MAPDIR" 2>/dev/null || {
     err "Cannot create mapfile directory '$MAPDIR' (override with --mapdir)"
@@ -231,6 +443,8 @@ check_single_vm_target() {
 
 # Attach runbook guidance when datastore is unmounted
 attach_help() {
+  local dev
+  dev=$(detect_vmfs_device 2>/dev/null) || dev=''
   printf '\n  %s\n' "${B}The datastore must be attached and mounted before copying:${R}"
   printf '  %s\n' \
     "  ${CY}1.${R} Windows PowerShell (Admin) - launch the attach helper:" \
@@ -241,8 +455,11 @@ attach_help() {
     "" \
     "  ${CY}3.${R} Mount VMFS6 inside WSL (read-only FUSE driver):" \
     "       sudo mkdir -p $SRC" \
-    "       sudo vmfs6-fuse /dev/sdX1 $SRC" \
+    "       sudo vmfs6-fuse ${dev:-/dev/sdX1} $SRC" \
     ""
+  [[ -n $dev ]] && printf '  %s\n\n' \
+    "${DIM}${dev} is the VMFS partition WSL can see right now.${R}"
+  return 0
 }
 
 #------------------------------------------------------------------------------
@@ -261,22 +478,45 @@ show_environment_card() {
   local src_detail="Not detected in /proc/mounts"
   local dev_line=""
 
-  if src_is_mounted "$SRC"; then
-    if $SUDO ls -A "$SRC" >/dev/null 2>&1; then
+  case "$(mount_state "$SRC")" in
+    LIVE)
       src_st="${GR}${B}MOUNTED (LIVE)${R}"
-      dev_line=$(awk -v m="$SRC" '$2 == m {print $1 " (" $3 ", " $4 ")"}' /proc/mounts 2>/dev/null)
+      dev_line=$(awk -v m="$SRC" '$2 == m {print $1 " (" $3 ")"}' /proc/mounts 2>/dev/null)
       src_detail="${dev_line:-fuse.vmfs6}"
-    else
-      src_st="${YL}${B}MOUNTED (ROOT ONLY)${R}"
-      src_detail="Accessible via sudo only"
-    fi
-  elif [[ -d $SRC ]] && [[ -n $($SUDO ls -A "$SRC" 2>/dev/null) ]]; then
-    src_st="${YL}${B}ACTIVE (NOT MOUNTPOINT)${R}"
-    src_detail="Directory has content"
-  fi
+      ;;
+    STALE)
+      if [[ ${EUID:-$(id -u)} -ne 0 && -z $SUDO ]]; then
+        src_st="${YL}${B}MOUNTED (ROOT ONLY)${R}"
+        src_detail="Accessible via sudo only (rerun with sudo)"
+      else
+        src_st="${RD}${B}BROKEN / STALE MOUNT${R}"
+        src_detail="Transport endpoint not connected (auto-remount on next action)"
+      fi
+      ;;
+    *)
+      if [[ -d $SRC ]] && [[ -n $(probe $SUDO ls -A "$SRC" 2>/dev/null) ]]; then
+        src_st="${YL}${B}ACTIVE (NOT MOUNTPOINT)${R}"
+        src_detail="Directory has content"
+      else
+        dev_line=$(detect_vmfs_device 2>/dev/null) || dev_line=''
+        if [[ -n $dev_line ]]; then
+          src_detail="$dev_line detected, not mounted yet (auto-mount on next action)"
+        fi
+      fi
+      ;;
+  esac
 
   local d_free d_total d_used_pct
   d_free=$(df -B1 --output=avail "$DEST" 2>/dev/null | tail -1 | tr -d ' ')
+  if [[ -z $d_free || $d_free == 0 ]]; then
+    if [[ $DEST =~ ^/mnt/([a-zA-Z])(/.*)?$ ]] && ! df -B1 "$DEST" >/dev/null 2>&1; then
+      local dletter="${BASH_REMATCH[1]^^}:"
+      $SUDO umount -l "$DEST" 2>/dev/null || true
+      $SUDO mkdir -p "$DEST" 2>/dev/null || true
+      $SUDO mount -t drvfs "$dletter" "$DEST" 2>/dev/null || true
+      d_free=$(df -B1 --output=avail "$DEST" 2>/dev/null | tail -1 | tr -d ' ')
+    fi
+  fi
   d_free=${d_free:-0}
   d_total=$(df -B1 --output=size "$DEST" 2>/dev/null | tail -1 | tr -d ' ')
   d_total=${d_total:-0}
@@ -367,11 +607,7 @@ NAMES=(); SIZES=(); NBIG=(); STATUS=()
 
 scan_datastore() {
   NAMES=(); SIZES=(); NBIG=(); STATUS=()
-  if ! src_is_mounted "$SRC" && [[ ! -d $SRC || -z $($SUDO ls -A "$SRC" 2>/dev/null) ]]; then
-    warn "Source '$SRC' is not mounted or has no contents."
-    attach_help
-    return 1
-  fi
+  ensure_source_ready || return 1
 
   local spin_chars=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
   local i=0
@@ -470,7 +706,7 @@ inspect_datastore_detailed() {
     while IFS= read -r -d '' f; do
       local fname fsize ftype
       fname=$(basename "$f")
-      fsize=$(stat -c %s "$f" 2>/dev/null || echo 0)
+      fsize=$($SUDO stat -c %s "$f" 2>/dev/null || echo 0)
       if [[ $fname == *.vmx ]]; then
         ftype="${CY}VMX Configuration${R}"
       elif [[ $fname == *-flat.vmdk ]]; then
@@ -903,7 +1139,10 @@ do_dry_run() {
 # Main Execution Loop
 #------------------------------------------------------------------------------
 show_header
-check_environment_prereqs
+if ! check_environment_prereqs; then
+  if ((!MENU_LOOP)); then exit 1; fi
+  warn "Fix the above, or correct the paths under [7] Configure Transfer Options."
+fi
 check_single_vm_target
 
 # Non-interactive CLI mode: execute directly without interactive loop

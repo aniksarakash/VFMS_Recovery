@@ -128,14 +128,26 @@ function Ask ($prompt, $default) {
 
 function Invoke-Step ($label, [scriptblock] $action) {
   if ($DryRun) { Note "would $label"; return $true }
-  $global:LASTEXITCODE = 0
+  # Sentinel tells a native command apart from a cmdlet: only a native resets
+  # $LASTEXITCODE. It matters because Windows PowerShell 5.1 files every stderr
+  # line in $Error even when the command exits 0, and usbipd reports progress on
+  # stderr, so judging a native by $Error would call a good attach a failure.
+  $sentinel = -999999
+  $global:LASTEXITCODE = $sentinel
   $before = $Error.Count
   $out = @()
   try { $out = @(& $action 2>&1) }
   catch { Bad "$label failed: $($_.Exception.Message)"; return $false }
-  if ($LASTEXITCODE -ne 0 -or $Error.Count -gt $before) {
-    $why = ''
-    if ($LASTEXITCODE -ne 0) { $why = " (exit $LASTEXITCODE)" }
+
+  $why = ''
+  $failed = $false
+  if ($LASTEXITCODE -ne $sentinel) {
+    if ($LASTEXITCODE -ne 0) { $failed = $true; $why = " (exit $LASTEXITCODE)" }
+  } elseif ($Error.Count -gt $before) {
+    $failed = $true
+  }
+
+  if ($failed) {
     Bad "$label failed$why"
     foreach ($l in $out) { if ("$l".Trim()) { Inf "    $DIM$l$RS" } }
     return $false
@@ -195,6 +207,17 @@ function Get-MountState ([string] $Path) {
 function Clear-StaleMount ([string] $Path) {
   Wsl "pkill -f '[v]mfs6-fuse .*$Path' 2>/dev/null; pkill -f '[v]mfs-fuse .*$Path' 2>/dev/null; exit 0" | Out-Null
   Wsl "fusermount -u -- '$Path' 2>/dev/null || umount -l -- '$Path' 2>/dev/null || umount -f -- '$Path' 2>/dev/null; exit 0" | Out-Null
+  $sh = @'
+for d in /proc/[0-9]*; do
+  [ -d "$d" ] || continue
+  p="${d#/proc/}"
+  if grep -q " __PATH__ " "$d/mountinfo" 2>/dev/null; then
+    nsenter -t "$p" -m -- fusermount -u -- '__PATH__' 2>/dev/null || nsenter -t "$p" -m -- umount -l -- '__PATH__' 2>/dev/null || true
+  fi
+done
+'@
+  $sh = $sh -replace '__PATH__', $Path
+  WslScript $sh | Out-Null
   Start-Sleep -Milliseconds 300
   Wsl "mkdir -p -- '$Path' 2>/dev/null; exit 0" | Out-Null
 }
@@ -246,8 +269,9 @@ for d in /proc/[0-9]*; do
   n=$(readlink "$d/ns/mnt" 2>/dev/null)
   [ -n "$n" ] || continue
   [ "$n" = "$mine" ] && continue
-  if grep -q " __PATH__ " "$d/mountinfo" 2>/dev/null; then s=SEES; else s=BLIND; fi
-  echo "$n|$s|${d#/proc/}|$(echo "$c" | cut -c1-48)"
+  pid="${d#/proc/}"
+  if nsenter -t "$pid" -m -- ls -1 "__PATH__" >/dev/null 2>&1; then s=SEES; else s=BLIND; fi
+  echo "$n|$s|$pid|$(echo "$c" | cut -c1-48)"
 done | awk -F'|' '!seen[$1]++'
 '@
   $sh = $sh -replace '__PATH__', $Path
@@ -263,11 +287,12 @@ done | awk -F'|' '!seen[$1]++'
 }
 
 function Add-MountToSession ([string] $TargetPid, [string] $Dev, [string] $Path) {
+  Wsl "nsenter -t $TargetPid -m -- fusermount -u -- '$Path' 2>/dev/null || nsenter -t $TargetPid -m -- umount -l -- '$Path' 2>/dev/null; exit 0" | Out-Null
   Wsl "nsenter -t $TargetPid -m -- mkdir -p -- '$Path' 2>&1; exit 0" | Out-Null
   $out = Wsl "nsenter -t $TargetPid -m -- vmfs6-fuse '$Dev' '$Path' 2>&1; exit 0"
   $seen = $false
   for ($i = 0; $i -lt 12; $i++) {
-    $chk = "$(Wsl "grep -q -- ' $Path ' /proc/$TargetPid/mountinfo && echo SEES || echo BLIND")"
+    $chk = "$(Wsl "nsenter -t $TargetPid -m -- ls -1 '$Path' >/dev/null 2>&1 && echo SEES || echo BLIND")"
     if ($chk -match 'SEES') { $seen = $true; break }
     Start-Sleep -Milliseconds 500
   }
@@ -520,7 +545,12 @@ PYEOF
 
   if (-not $info -or -not $info.folders -or $info.folders.Count -eq 0) {
     if ($DryRun -or $Simulated) {
-      Note 'Datastore is not currently mounted live in WSL. Showing visual preview based on datastore recovery profile.'
+      Write-Host ''
+      Write-Host "  $RD$BD*** SAMPLE LAYOUT - NOT YOUR DATASTORE ***$RS"
+      Write-Host "  $RD Nothing was read from $Path. The datastore is not mounted, so the tree$RS"
+      Write-Host "  $RD below is placeholder data showing the shape of the report only. Do not$RS"
+      Write-Host "  $RD read any name, size or verdict in it as a fact about your disk.$RS"
+      Write-Host ''
       $info = [pscustomobject]@{
         mount = $Path
         mounted = $true
@@ -804,20 +834,21 @@ function Test-VmfsFileSystem {
   Write-Host ''
 
   if ($Simulated) {
-    Note 'Simulated mode: datastore is not currently attached live.'
-    Inf "  ${DIM}Partition : /dev/sdd1 (931.5G, VMware VMFS)$RS"
-    Inf "  ${DIM}Mountpoint: $Path$RS"
+    Write-Host "  $RD$BD*** NOT A REAL RESULT - THE DATASTORE IS NOT MOUNTED ***$RS"
     Write-Host ''
-    Inf "  $GR[ok]$RS ${BD}VMFS6 Magic & Signatures${RS}: Valid (VMFS_volume_member, UUID 67471035-8ae0823c-aaa8-b42e99a8691a)"
-    Inf "  $GR[ok]$RS ${BD}FUSE Mountpoint${RS}         : Active ($Path mounted with vmfs6-fuse)"
-    Inf "  $GR[ok]$RS ${BD}Volume Allocation Headers${RS}: .vh.sf (7.0M), .sbc.sf (1.0G), .fdc.sf (128.6M) verified"
-    Inf "  $GR[ok]$RS ${BD}Directory Inodes${RS}         : 5 VM folders, 93 files traversed without read errors"
-    Inf "  $GR[ok]$RS ${BD}VM Descriptors${RS}           : All .vmx and .vmdk descriptors valid and readable"
-    Inf "  $GR[ok]$RS ${BD}Block Storage I/O${RS}        : Extent sample reads (1 MB) verified 0 bad sectors"
+    Note "Nothing was read from $Path. The lines below are an example of what a"
+    Note 'healthy report looks like, so you can see the shape of the output.'
     Write-Host ''
-    Ok "${GR}${BD}Filesystem Status: HEALTHY & FULLY RECOVERABLE$RS"
+    Inf "  ${DIM}[example] VMFS6 Magic & Signatures : would confirm the volume UUID$RS"
+    Inf "  ${DIM}[example] FUSE Mountpoint          : would confirm vmfs6-fuse is serving $Path$RS"
+    Inf "  ${DIM}[example] Volume Allocation Headers: would verify .vh.sf / .sbc.sf / .fdc.sf$RS"
+    Inf "  ${DIM}[example] Directory Inodes         : would traverse every VM folder$RS"
+    Inf "  ${DIM}[example] VM Descriptors           : would read each .vmx and .vmdk$RS"
+    Inf "  ${DIM}[example] Block Storage I/O        : would sample each -flat.vmdk extent$RS"
     Write-Host ''
-    return $true
+    Bad "${RD}${BD}Filesystem Status: UNKNOWN - attach and mount the datastore, then test again.$RS"
+    Write-Host ''
+    return $false
   }
 
   if (-not $Dev) {
@@ -961,22 +992,28 @@ PYEOF
   }
 
   # 2. System files
+  # A .sf name that is simply absent is not damage: which allocation files exist
+  # varies by volume, and vmfs6-fuse does not always list dot-files. Only a file
+  # that exists and will not read is evidence of a problem.
   $sysKeys = @($tInfo.system_files.psobject.Properties.Name)
-  $allSysOk = $true
   $sysDetails = @()
+  $sysMissing = @()
+  $sysBad     = @()
   foreach ($sk in $sysKeys) {
     $sf = $tInfo.system_files.$sk
-    if ($sf.exists -and $sf.readable) {
-      $sysDetails += "$sk ($(Human $sf.size))"
-    } else {
-      $allSysOk = $false
-    }
+    if ($sf.exists -and $sf.readable) { $sysDetails += "$sk ($(Human $sf.size))" }
+    elseif ($sf.exists)               { $sysBad     += $sk }
+    else                              { $sysMissing += $sk }
   }
-  if ($allSysOk -and $sysDetails.Count -gt 0) {
+  $allSysOk = ($sysBad.Count -eq 0 -and $sysDetails.Count -gt 0)
+  if ($allSysOk) {
     Ok "Volume System Allocation Files: $($sysDetails.Count) structures verified readable."
     Inf "     $DIM$($sysDetails -join ', ')$RS"
+    if ($sysMissing.Count) { Inf "     ${DIM}Not present on this volume: $($sysMissing -join ', ')$RS" }
+  } elseif ($sysBad.Count) {
+    Bad "Volume System Allocation Files: present but unreadable: $($sysBad -join ', ')."
   } else {
-    Bad "Volume System Allocation Files: One or more critical system files are missing or unreadable."
+    Bad "Volume System Allocation Files: none of $($sysKeys -join ', ') could be read."
   }
 
   # 3. Directories & inodes
@@ -1002,11 +1039,21 @@ PYEOF
     Bad "Storage Extent Read I/O: $($tInfo.io_test_err) disk image I/O read errors encountered."
   }
 
+  # "Healthy" has to mean something was actually read. With no folders, no
+  # descriptors and no extents, every check above passed vacuously.
+  $sawContent = (($tInfo.directories_count -gt 0) -or ($tInfo.descriptors_ok -gt 0) -or ($tInfo.io_test_ok -gt 0))
+
   Write-Host ''
-  if ($tInfo.healthy -and $allSysOk) {
+  if ($tInfo.healthy -and $allSysOk -and $sawContent) {
     Ok "${GR}${BD}Filesystem Health Verdict: HEALTHY & FULLY RECOVERABLE (100% Integrity)$RS"
     Write-Host ''
     return $true
+  } elseif ($tInfo.healthy -and $allSysOk) {
+    Bad "${YL}${BD}Filesystem Health Verdict: NO CONTENT READ$RS"
+    Inf "  ${DIM}The mount answered, but no VM folder, descriptor or disk extent could be$RS"
+    Inf "  ${DIM}read from it. Confirm this is the datastore partition and not ESXi OSDATA.$RS"
+    Write-Host ''
+    return $false
   } else {
     Bad "${RD}${BD}Filesystem Health Verdict: ISSUES DETECTED$RS"
     foreach ($err in $tInfo.errors) {
@@ -1097,7 +1144,14 @@ function Show-InteractiveMenu {
 }
 
 $isInteractiveSession = ($Menu -or (-not $Mount -and -not $Detach -and -not $Cycle -and -not $Test -and -not $Inspect -and -not $DryRun))
-$script:menuLoop = ($isInteractiveSession -and -not $Yes)
+$script:menuLoop = ($isInteractiveSession -and -not $Yes -and -not [Console]::IsInputRedirected)
+
+# Only what the operator typed on the command line may survive a menu iteration.
+# A BUSID or disk number discovered during one action must not silently become
+# the target of the next: the enclosure may have been unplugged in between, and
+# a different drive can now answer to that bus.
+$script:paramBusId      = $BusId
+$script:paramDiskNumber = $DiskNumber
 $script:isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 function Return-OrExit ([int]$Code = 0) {
@@ -1125,6 +1179,11 @@ function Return-OrExit ([int]$Code = 0) {
     $Test    = $false
     $Inspect = $false
     $DryRun  = $false
+
+    $BusId      = $script:paramBusId
+    $DiskNumber = $script:paramDiskNumber
+    $DiskSize   = 0
+    $PartName   = ''
 
     $menuChoice = Show-InteractiveMenu
     switch ($menuChoice.ToUpper()) {
@@ -1266,7 +1325,7 @@ if ($Detach -or $Cycle) {
 
   Step '2.' 'Detach the enclosure from WSL'
   if (-not $BusId) {
-    $att = @(Get-Enclosure | Where-Object { $_.State -eq 'Attached' })
+    $att = @(Get-Enclosure | Where-Object { $_.State -eq 'Attached' -and $_.IsMass })
     if ($att.Count -eq 1) {
       $BusId = $att[0].BusId
       Inf "Only one attached device: $BD$BusId$RS $DIM$($att[0].Device)$RS"
@@ -1306,9 +1365,16 @@ if ($Detach -or $Cycle) {
     if ($DiskNumber -ge 0) {
       $off = @($off | Where-Object { $_.Number -eq $DiskNumber })
     } elseif ($off.Count -gt 1) {
+      # Onlining is not a safe default here. Another offline USB disk may be a
+      # second staged datastore, or one the operator offlined deliberately, and
+      # Windows offers to format a VMFS disk the moment it comes online.
       Note "$($off.Count) USB disks are offline: $(($off.Number) -join ', ')."
-      $which = Ask 'Online which one? [all]' 'all'
-      if ($which -notmatch '^\s*all\s*$') {
+      foreach ($d in $off) { Inf "    disk $($d.Number): $($d.FriendlyName) $DIM$(Human $d.Size)$RS" }
+      $which = Ask 'Online which one? Disk number, "all", or Enter to leave them all offline [none]' 'none'
+      if ($which -match '^\s*none\s*$' -or [string]::IsNullOrWhiteSpace($which)) {
+        $off = @()
+        Note 'Left every disk offline.'
+      } elseif ($which -notmatch '^\s*all\s*$') {
         if ("$which" -notmatch '^\s*\d+\s*$') { Die "'$which' is not a disk number." }
         $off = @($off | Where-Object { $_.Number -eq [int]("$which".Trim()) })
       }
@@ -1757,11 +1823,21 @@ $PartName = ''
 if ($DryRun) {
   $PartName = 'sdX1'
 } else {
-  $best = 0
-  foreach ($l in @(Wsl "lsblk -b -ln -o NAME,SIZE,TYPE /dev/$SdName 2>/dev/null")) {
-    if ("$l" -match '^\s*(\S+)\s+(\d+)\s+part') {
-      if ([long]$Matches[2] -gt $best) { $best = [long]$Matches[2]; $PartName = $Matches[1] }
+  # An ESXi disk carries two VMFS members: the small one is OSDATA, the large
+  # one is the datastore. Prefer the tagged partitions over raw size so a large
+  # non-VMFS partition on the same disk can never win.
+  $best = 0; $bestAny = 0; $anyName = ''
+  foreach ($l in @(Wsl "lsblk -b -ln -o NAME,SIZE,TYPE,FSTYPE /dev/$SdName 2>/dev/null")) {
+    if ("$l" -match '^\s*(\S+)\s+(\d+)\s+part\s*(\S*)') {
+      $pName = $Matches[1]; $pSize = [long]$Matches[2]; $pFs = "$($Matches[3])"
+      if ($pFs -eq 'VMFS_volume_member' -and $pSize -gt $best) { $best = $pSize; $PartName = $pName }
+      if ($pSize -gt $bestAny) { $bestAny = $pSize; $anyName = $pName }
     }
+  }
+  if (-not $PartName -and $anyName) {
+    $PartName = $anyName
+    $best     = $bestAny
+    Note "No VMFS-tagged partition on /dev/$SdName; falling back to its largest partition."
   }
   if (-not $PartName) {
     $PartName = $SdName
@@ -1915,7 +1991,20 @@ if ($Inspect -or $DryRun) {
 
 Write-Host ''; Hr
 if ($DryRun) { Note 'Plan complete. Nothing was attached or mounted, because -DryRun was set.' }
-else { Ok 'Datastore is mounted and readable.' }
+else {
+  Ok 'Datastore is mounted and readable.'
+  if ($Dest -match '^/mnt/([A-Za-z])') {
+    $dLetter = "$($Matches[1].ToUpper()):"
+    $dCheck = "$(Wsl "df -B1 '$Dest' >/dev/null 2>&1 && echo OK || echo FAIL")"
+    if ($dCheck -notmatch 'OK') {
+      Wsl "umount -l '$Dest' 2>/dev/null; mkdir -p '$Dest' 2>/dev/null; mount -t drvfs '$dLetter' '$Dest' 2>/dev/null; exit 0" | Out-Null
+      $dCheck2 = "$(Wsl "df -B1 '$Dest' >/dev/null 2>&1 && echo OK || echo FAIL")"
+      if ($dCheck2 -match 'OK') {
+        Ok "Destination drive $Dest ($dLetter) verified and ready in WSL."
+      }
+    }
+  }
+}
 Write-Host ''
 Inf "  ${BD}Next, inside WSL (or in your WSL terminal):$RS"
 Inf "     $DIM sudo ./vmfs-copy.sh --src $Src --dest $Dest$RS"
